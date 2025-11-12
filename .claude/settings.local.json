@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio run:*)",
+      "Bash(where:*)",
+      "Bash(where pio:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
