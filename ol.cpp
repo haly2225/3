@@ -395,17 +395,17 @@ private:
                 break;
             }
         }
-        
+
         if (marker_pos < 0) return false;
-        
-        uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) | 
+
+        uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
-        
+
         if (!frame_initialized) {
             frame_initialized = true;
             logger.log("📍 Sync OK");
         }
-        
+
         // Parse ADC
         std::array<uint16_t, BUFFER_SIZE> samples;
         for (size_t i = 0; i < BUFFER_SIZE; i++) {
@@ -414,11 +414,18 @@ private:
             if (val > ADC_MAX) return false;
             samples[i] = val;
         }
-        
+
         // Convert to voltage
         std::array<float, BUFFER_SIZE> voltage;
         for (size_t i = 0; i < BUFFER_SIZE; i++) {
             voltage[i] = samples[i] * (VCC / ADC_MAX);
+        }
+
+        // Store in circular buffer history for continuous data
+        buffer_history[history_write_pos] = voltage;
+        history_write_pos = (history_write_pos + 1) % HISTORY_BUFFERS;
+        if (buffers_in_history < HISTORY_BUFFERS) {
+            buffers_in_history++;
         }
         
         // Measure Vpp
@@ -560,14 +567,10 @@ private:
 
             case State::IDLE: {
                 // Find rising edge and trigger
-                if (vpp > TRIGGER_THRESHOLD) {
+                if (vpp > TRIGGER_THRESHOLD && buffers_in_history >= 2) {
                     int edge_idx = find_simple_edge(voltage);
 
                     if (edge_idx >= 0) {
-                        // Edge found in window - start capture from ACTUAL edge position
-                        // This ensures edge always appears at SAME position in display (position 0)
-                        const int TARGET_EDGE_POS_IN_DISPLAY = 0;
-
                         stats.trigger_count++;
 
                         // Log only every 20 triggers to reduce spam
@@ -575,27 +578,33 @@ private:
                         if (++trigger_log_count % 20 == 1) {
                             std::ostringstream oss;
                             oss << "🎯 TRIGGER! edge=" << edge_idx
-                                << " @" << TARGET_EDGE_POS_IN_DISPLAY << " in display"
                                 << ", vpp=" << std::fixed << std::setprecision(2) << vpp << "V";
                             logger.log(oss.str());
                         }
 
-                        // Start capture from ACTUAL edge position (not fixed TARGET)
-                        // This ensures edge always appears at display position 0
+                        // Use ONLY current buffer post-trigger data for zero jitter
+                        // This ensures 100% continuous data with no gaps between buffers
+                        std::lock_guard<std::mutex> lock(data_mutex);
+
                         temp_size = 0;
 
-                        // Copy from ACTUAL edge position onwards
-                        for (int i = edge_idx; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                        // Copy from edge position to end of current buffer
+                        for (int i = edge_idx; i < BUFFER_SIZE; i++) {
                             temp_buffer[temp_size++] = voltage[i];
                         }
 
-                        // Store edge position for subsequent buffers
-                        first_edge_position = edge_idx;
+                        // Copy to display
+                        for (size_t i = 0; i < temp_size; i++) {
+                            display_voltage[i] = temp_buffer[i];
+                            display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                        }
+                        display_size = temp_size;
+                        new_data = true;
 
-                        state = State::COLLECTING;
-                        collect_count = 1;
+                        state = State::HOLDOFF;
+                        last_trigger_time = now;
 
-                        return false;  // Continue collecting
+                        return true;
                     }
                 }
                 return false;
@@ -604,39 +613,10 @@ private:
             case State::LEARNING:  // No longer used, but keep for compatibility
             case State::TRIGGERED:
             case State::COLLECTING: {
-                // Collect continuation data - collect ENTIRE buffer for continuous timeline
-                if (vpp > TRIGGER_THRESHOLD) {
-                    // Valid signal - collect ENTIRE buffer (0-511) for continuous data
-                    // First buffer started at edge position, subsequent buffers continue timeline
-                    for (size_t i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                        temp_buffer[temp_size++] = voltage[i];
-                    }
-                    collect_count++;
-                } else {
-                    // No signal - skip
-                    return false;
-                }
-
-                if (temp_size >= CAPTURE_SIZE) {
-                    std::lock_guard<std::mutex> lock(data_mutex);
-
-                    size_t copy_size = std::min(temp_size, CAPTURE_SIZE);
-                    for (size_t i = 0; i < copy_size; i++) {
-                        display_voltage[i] = temp_buffer[i];
-                        display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
-                    }
-                    display_size = copy_size;
-                    new_data = true;
-
-                    // Reset edge position tracker for next capture
-                    first_edge_position = -1;
-
-                    state = State::HOLDOFF;
-                    last_trigger_time = now;
-
-                    return true;
-                }
-                break;
+                // Old collecting logic - no longer needed with circular buffer
+                // Just transition back to IDLE
+                state = State::IDLE;
+                return false;
             }
         }
 
