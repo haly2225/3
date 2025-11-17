@@ -572,7 +572,7 @@ private:
 
             case State::IDLE: {
                 // Find rising edge and trigger
-                if (vpp > TRIGGER_THRESHOLD && buffers_in_history >= 2) {
+                if (vpp > TRIGGER_THRESHOLD && buffers_in_history >= HISTORY_BUFFERS) {
                     int edge_idx = find_simple_edge(voltage);
 
                     if (edge_idx >= 0) {
@@ -587,23 +587,14 @@ private:
                             logger.log(oss.str());
                         }
 
-                        // Use SINGLE BUFFER ONLY for zero jitter and 100% continuous data
-                        // Copy from edge position to end of current buffer
-                        // This gives ~410 samples @ 600kHz = ~0.68ms of continuous waveform
+                        // DELAYED TRIGGER: Save trigger info and wait for more buffers
+                        // This allows us to collect full 1200 samples from history
+                        trigger_buffer_index = (history_write_pos - 1 + HISTORY_BUFFERS) % HISTORY_BUFFERS;
+                        trigger_edge_position = edge_idx;
+                        buffers_since_trigger = 0;
 
-                        std::lock_guard<std::mutex> lock(data_mutex);
-
-                        size_t samples_to_copy = BUFFER_SIZE - edge_idx;
-                        for (size_t i = 0; i < samples_to_copy; i++) {
-                            display_voltage[i] = voltage[edge_idx + i];
-                            display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
-                        }
-                        display_size = samples_to_copy;
-                        new_data = true;
-
-                        state = State::HOLDOFF;
-                        last_trigger_time = now;
-                        return true;
+                        state = State::COLLECTING;
+                        return false;
                     }
                 }
                 return false;
@@ -612,8 +603,59 @@ private:
             case State::LEARNING:  // No longer used, but keep for compatibility
             case State::TRIGGERED:
             case State::COLLECTING: {
-                // No longer used - all data comes from history
-                state = State::IDLE;
+                // Wait for 2 more buffers after trigger, then extract from history
+                if (vpp < TRIGGER_THRESHOLD) {
+                    // Signal lost - abort
+                    state = State::IDLE;
+                    return false;
+                }
+
+                buffers_since_trigger++;
+
+                // Need 2 more buffers for full CAPTURE_SIZE (1200 samples)
+                // Buffer with edge: ~410 samples (512 - 102)
+                // Buffer +1: 512 samples
+                // Buffer +2: ~280 samples
+                // Total: ~1200 samples
+                if (buffers_since_trigger >= 2) {
+                    std::lock_guard<std::mutex> lock(data_mutex);
+                    temp_size = 0;
+
+                    // Extract from history:
+                    // Start buffer: trigger_buffer_index, position: trigger_edge_position
+                    // Current buffer is at: (history_write_pos - 1 + HISTORY_BUFFERS) % HISTORY_BUFFERS
+
+                    // Buffer 0 (trigger buffer): from edge to end
+                    int buf_idx = trigger_buffer_index;
+                    for (int i = trigger_edge_position; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                        temp_buffer[temp_size++] = buffer_history[buf_idx][i];
+                    }
+
+                    // Buffer 1: entire buffer
+                    buf_idx = (trigger_buffer_index + 1) % HISTORY_BUFFERS;
+                    for (int i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                        temp_buffer[temp_size++] = buffer_history[buf_idx][i];
+                    }
+
+                    // Buffer 2: partial buffer until CAPTURE_SIZE
+                    buf_idx = (trigger_buffer_index + 2) % HISTORY_BUFFERS;
+                    for (int i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                        temp_buffer[temp_size++] = buffer_history[buf_idx][i];
+                    }
+
+                    // Copy to display
+                    for (size_t i = 0; i < temp_size; i++) {
+                        display_voltage[i] = temp_buffer[i];
+                        display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                    }
+                    display_size = temp_size;
+                    new_data = true;
+
+                    state = State::HOLDOFF;
+                    last_trigger_time = now;
+                    return true;
+                }
+
                 return false;
             }
         }
