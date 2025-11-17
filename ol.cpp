@@ -20,6 +20,7 @@
 #include <QPushButton>
 #include <QButtonGroup>
 #include <QTextEdit>
+#include <QKeyEvent>
 #include <cstdint>
 #include <vector>
 #include <array>
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <cmath>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -45,7 +47,7 @@ constexpr uint16_t PACKET_SIZE = 4 + BUFFER_SIZE * 2;
 constexpr float    SAMPLE_RATE = 600000.0f;
 constexpr float    VCC = 3.3f;
 constexpr uint16_t ADC_MAX = 4095;
-constexpr size_t   CAPTURE_SIZE = 2560;
+constexpr size_t   CAPTURE_SIZE = 1200;  // ~2ms @ 600kHz - always collect same number of samples after edge
 
 // Trigger modes
 enum class TriggerMode {
@@ -154,7 +156,16 @@ private:
     std::array<float, 8192> temp_buffer;
     size_t temp_size = 0;
     size_t collect_count = 0;
-    
+
+    // Circular buffer for pre-trigger data (keeps last 4 buffers = 2048 samples)
+    static constexpr int HISTORY_BUFFERS = 4;
+    std::array<std::array<float, BUFFER_SIZE>, HISTORY_BUFFERS> buffer_history;
+    int history_write_pos = 0;
+    int buffers_in_history = 0;
+
+    // Trigger consistency - store first edge position to ensure all buffers match
+    int first_edge_position = -1;
+
     // Learning
     std::vector<int> edge_history;
     int stable_edge_offset = -1;
@@ -168,6 +179,11 @@ private:
     float last_vpp = 0.0f;
     const float TRIGGER_THRESHOLD = 2.0f;
     bool was_triggered = false;
+
+    // Trigger level adjustment (like real oscilloscope)
+    float trigger_level = 1.65f;  // Default: mid-point of 0-3.3V
+    const float TRIGGER_LEVEL_STEP = 0.05f;  // 50mV steps
+    int trigger_level_changes = 0;  // Count changes for periodic logging
     
     std::chrono::steady_clock::time_point last_packet_time;
     bool first_packet_received = false;
@@ -180,10 +196,40 @@ public:
         display_voltage.fill(0);
         display_time.fill(0);
         temp_buffer.fill(0);
+        for (auto& buf : buffer_history) {
+            buf.fill(0);
+        }
     }
     
     ~SPIReader() { stop(); }
-    
+
+    // Trigger level adjustment (like real oscilloscope)
+    void increaseTriggerLevel() {
+        trigger_level = std::min(trigger_level + TRIGGER_LEVEL_STEP, 3.3f);
+        trigger_level_changes++;
+
+        // Only log every 4 changes (0.2V) or at max boundary
+        if (trigger_level >= 3.3f || trigger_level_changes % 4 == 0) {
+            std::ostringstream oss;
+            oss << "🎯 Trigger Level: " << std::fixed << std::setprecision(2) << trigger_level << "V";
+            logger.log(oss.str());
+        }
+    }
+
+    void decreaseTriggerLevel() {
+        trigger_level = std::max(trigger_level - TRIGGER_LEVEL_STEP, 0.0f);
+        trigger_level_changes++;
+
+        // Only log every 4 changes (0.2V) or at min boundary
+        if (trigger_level <= 0.0f || trigger_level_changes % 4 == 0) {
+            std::ostringstream oss;
+            oss << "🎯 Trigger Level: " << std::fixed << std::setprecision(2) << trigger_level << "V";
+            logger.log(oss.str());
+        }
+    }
+
+    float getTriggerLevel() const { return trigger_level; }
+
     bool init() {
         logger.log("🔧 Init SPI...");
         
@@ -265,12 +311,8 @@ public:
     
     void set_trigger_mode(TriggerMode mode) {
         trigger_mode = mode;
-        state = State::IDLE;
-        phase_locked = false;
-        edge_history.clear();
-        stable_edge_offset = -1;
-        learn_count = 0;
-        
+        // Don't reset state - allow seamless mode switching!
+
         std::string mode_str;
         switch(mode) {
             case TriggerMode::AUTO: mode_str = "🤖 AUTO"; break;
@@ -387,6 +429,15 @@ private:
         }
         float vpp = vmax - vmin;
         last_vpp = vpp;
+
+        // DEBUG: Log signal measurements every 100 frames
+        static int debug_counter = 0;
+        if (debug_counter++ % 100 == 0) {
+            std::ostringstream oss;
+            oss << "📊 Vpp=" << std::fixed << std::setprecision(2) << vpp
+                << "V, Max=" << vmax << "V, Min=" << vmin << "V, Frame=" << frame_num;
+            logger.log(oss.str());
+        }
         
         // Signal detection
         if (vpp > 0.5f) {
@@ -451,74 +502,124 @@ private:
         return false;
     }
     
+    // Extract samples from circular buffer history
+    // offset: how many samples back from the most recent sample (can be negative for future)
+    // count: how many samples to extract
+    bool extract_from_history(int offset_from_latest, size_t count) {
+        if (buffers_in_history == 0) return false;
+
+        temp_size = 0;
+
+        // Current buffer position (most recently written)
+        int current_buf = (history_write_pos - 1 + HISTORY_BUFFERS) % HISTORY_BUFFERS;
+
+        // Start from (BUFFER_SIZE - 1 - offset_from_latest) in the history
+        // offset_from_latest=0 means most recent sample
+        // offset_from_latest=BUFFER_SIZE means one buffer back
+
+        int total_available = buffers_in_history * BUFFER_SIZE;
+        if (offset_from_latest + (int)count > total_available) {
+            return false;  // Not enough history
+        }
+
+        int samples_extracted = 0;
+        int current_offset = offset_from_latest;
+
+        while (samples_extracted < (int)count && temp_size < temp_buffer.size()) {
+            // Which buffer and which sample within that buffer?
+            int buffer_idx = current_offset / BUFFER_SIZE;
+            int sample_idx = current_offset % BUFFER_SIZE;
+
+            // Get the actual buffer index in circular buffer (going backwards from current)
+            int actual_buf_idx = (current_buf - buffer_idx + HISTORY_BUFFERS * 10) % HISTORY_BUFFERS;
+
+            // Extract sample
+            temp_buffer[temp_size++] = buffer_history[actual_buf_idx][BUFFER_SIZE - 1 - sample_idx];
+            samples_extracted++;
+            current_offset++;
+        }
+
+        return temp_size == count;
+    }
+
     bool handle_normal_trigger(const std::array<float, BUFFER_SIZE>& voltage,
                                uint16_t frame_num, float vpp) {
         auto now = std::chrono::steady_clock::now();
-        
+
         switch (state) {
             case State::HOLDOFF: {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_trigger_time
                 ).count();
-                
+
                 if (elapsed >= HOLDOFF_MS) {
                     state = State::IDLE;
                 }
                 return false;
             }
-            
+
             case State::IDLE: {
-                // Start learning phase
-                if (!phase_locked && (frame_num % 10) == 0 && vpp > TRIGGER_THRESHOLD) {
-                    first_trigger_frame = frame_num % 100;
-                    phase_locked = true;
-                    state = State::LEARNING;
-                    learn_count = 0;
-                    edge_history.clear();
-                    
-                    logger.log("🎓 LEARNING...");
-                }
-                return false;
-            }
-            
-            case State::LEARNING: {
-                if ((frame_num % 100) != (first_trigger_frame % 100)) {
-                    return false;
-                }
-                
-                // Find edge
-                int edge_idx = find_edge(voltage);
-                
-                if (edge_idx > 0) {
-                    edge_history.push_back(edge_idx);
-                    learn_count++;
-                    
-                    if (learn_count >= LEARN_FRAMES) {
-                        // Calculate median
-                        std::sort(edge_history.begin(), edge_history.end());
-                        stable_edge_offset = edge_history[LEARN_FRAMES / 2];
-                        
-                        std::ostringstream oss;
-                        oss << "✅ LEARNED offset=" << stable_edge_offset;
-                        logger.log(oss.str());
-                        
-                        state = State::IDLE;
+                // Find rising edge and trigger
+                if (vpp > TRIGGER_THRESHOLD) {
+                    int edge_idx = find_simple_edge(voltage);
+
+                    if (edge_idx >= 0) {
+                        // Edge found in window - start capture from ACTUAL edge position
+                        // This ensures edge always appears at SAME position in display (position 0)
+                        const int TARGET_EDGE_POS_IN_DISPLAY = 0;
+
+                        stats.trigger_count++;
+
+                        // Log only every 20 triggers to reduce spam
+                        static int trigger_log_count = 0;
+                        if (++trigger_log_count % 20 == 1) {
+                            std::ostringstream oss;
+                            oss << "🎯 TRIGGER! edge=" << edge_idx
+                                << " @" << TARGET_EDGE_POS_IN_DISPLAY << " in display"
+                                << ", vpp=" << std::fixed << std::setprecision(2) << vpp << "V";
+                            logger.log(oss.str());
+                        }
+
+                        // Start capture from ACTUAL edge position (not fixed TARGET)
+                        // This ensures edge always appears at display position 0
+                        temp_size = 0;
+
+                        // Copy from ACTUAL edge position onwards
+                        for (int i = edge_idx; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                            temp_buffer[temp_size++] = voltage[i];
+                        }
+
+                        // Store edge position for subsequent buffers
+                        first_edge_position = edge_idx;
+
+                        state = State::COLLECTING;
+                        collect_count = 1;
+
+                        return false;  // Continue collecting
                     }
                 }
                 return false;
             }
-            
+
+            case State::LEARNING:  // No longer used, but keep for compatibility
             case State::TRIGGERED:
             case State::COLLECTING: {
-                // Collect data
-                for (size_t i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                    temp_buffer[temp_size++] = voltage[i];
+                // Collect continuation data - collect ENTIRE buffer for continuous timeline
+                if (vpp > TRIGGER_THRESHOLD) {
+                    // Valid signal - collect ENTIRE buffer (0-511) for continuous data
+                    // First buffer started at edge position, subsequent buffers continue timeline
+                    for (size_t i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                        temp_buffer[temp_size++] = voltage[i];
+                    }
+                    collect_count++;
+                } else {
+                    // No signal - skip
+                    return false;
                 }
-                collect_count++;
-                
+
                 if (temp_size >= CAPTURE_SIZE) {
                     std::lock_guard<std::mutex> lock(data_mutex);
-                    
+
                     size_t copy_size = std::min(temp_size, CAPTURE_SIZE);
                     for (size_t i = 0; i < copy_size; i++) {
                         display_voltage[i] = temp_buffer[i];
@@ -526,82 +627,125 @@ private:
                     }
                     display_size = copy_size;
                     new_data = true;
-                    
+
+                    // Reset edge position tracker for next capture
+                    first_edge_position = -1;
+
                     state = State::HOLDOFF;
                     last_trigger_time = now;
-                    
+
                     return true;
                 }
                 break;
             }
         }
-        
-        // Try to trigger (after learning)
-        if (state == State::IDLE && stable_edge_offset > 0 && 
-            (frame_num % 100) == (first_trigger_frame % 100) && 
-            vpp > TRIGGER_THRESHOLD) {
-            
-            // Find edge near expected position
-            int edge_idx = find_edge_near(voltage, stable_edge_offset);
-            
-            if (edge_idx > 0) {
-                stats.trigger_count++;
-                
-                state = State::COLLECTING;
-                temp_size = 0;
-                collect_count = 0;
-                
-                // Start from edge
-                for (size_t i = edge_idx; i < BUFFER_SIZE && temp_size < temp_buffer.size(); i++) {
-                    temp_buffer[temp_size++] = voltage[i];
-                }
-                collect_count++;
-                
-                return true;
-            }
-        }
-        
+
         return false;
     }
     
+    // Simple edge detection - like a real oscilloscope!
+    // Find edge - like real oscilloscope!
+    int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
+        // Search window for good trigger rate, return ACTUAL edge position for zero jitter
+        // Position: 20% of buffer (102) ±2 samples
+        const int TARGET = BUFFER_SIZE / 5;  // 102
+        const int WINDOW = 2;  // ±2 samples
+
+        // Check for rising edge in window 100-104
+        for (int i = TARGET - WINDOW; i <= TARGET + WINDOW; i++) {
+            if (voltage[i - 1] < trigger_level && voltage[i] >= trigger_level) {
+                // Return ACTUAL edge position (not TARGET)
+                // This ensures edge always appears at same display position (start of waveform)
+                return i;
+            }
+        }
+
+        return -1;  // No edge in window
+    }
+
+    // Old edge detection (for reference, not used)
     int find_edge(const std::array<float, BUFFER_SIZE>& voltage) {
+        int candidates = 0;
+        int rejected_pre = 0;
+        int rejected_post = 0;
+
         for (size_t i = 20; i < BUFFER_SIZE - 20; i++) {
             if (voltage[i-1] < 1.0f && voltage[i] > 2.3f) {
+                candidates++;
                 // Verify clean
                 bool clean = true;
                 for (int j = -5; j < 0; j++) {
-                    if (voltage[i+j] > 1.2f) { clean = false; break; }
+                    if (voltage[i+j] > 1.2f) {
+                        clean = false;
+                        rejected_pre++;
+                        break;
+                    }
                 }
                 if (clean) {
                     for (int j = 1; j <= 5; j++) {
-                        if (voltage[i+j] < 2.0f) { clean = false; break; }
+                        if (voltage[i+j] < 2.0f) {
+                            clean = false;
+                            rejected_post++;
+                            break;
+                        }
                     }
                 }
-                if (clean) return i;
+                if (clean) {
+                    std::ostringstream oss;
+                    oss << "✅ Edge found at i=" << i << " (candidates=" << candidates << ")";
+                    logger.log(oss.str());
+                    return i;
+                }
             }
+        }
+
+        if (candidates > 0) {
+            std::ostringstream oss;
+            oss << "❌ No clean edge. Candidates=" << candidates
+                << ", rejected_pre=" << rejected_pre
+                << ", rejected_post=" << rejected_post;
+            logger.log(oss.str());
         }
         return -1;
     }
     
     int find_edge_near(const std::array<float, BUFFER_SIZE>& voltage, int expected) {
-        int start = std::max(20, expected - 30);
-        int end = std::min((int)BUFFER_SIZE - 20, expected + 30);
-        
+        // Widen search window due to high jitter (seen 20-79 range in learning)
+        int start = std::max(20, expected - 60);
+        int end = std::min((int)BUFFER_SIZE - 20, expected + 60);
+        int candidates = 0;
+        int best_edge = -1;
+        int best_distance = 999;
+
+        // First try: look for rising edge 0V → 3.3V anywhere in window
         for (int i = start; i < end; i++) {
-            if (voltage[i-1] < 1.0f && voltage[i] > 2.3f) {
-                bool clean = true;
-                for (int j = -5; j < 0; j++) {
-                    if (voltage[i+j] > 1.2f) { clean = false; break; }
+            if (voltage[i-1] < 1.65f && voltage[i] >= 1.65f) {  // Simple threshold crossing
+                candidates++;
+                int distance = std::abs(i - expected);
+                if (distance < best_distance) {
+                    best_edge = i;
+                    best_distance = distance;
                 }
-                if (clean) {
-                    for (int j = 1; j <= 5; j++) {
-                        if (voltage[i+j] < 2.0f) { clean = false; break; }
-                    }
-                }
-                if (clean) return i;
             }
         }
-        return expected;  // Fallback
+
+        if (best_edge >= 0) {
+            std::ostringstream oss;
+            oss << "🔍 find_edge_near: Found at " << best_edge
+                << " (expected=" << expected << ", delta=" << (best_edge - expected)
+                << ", candidates=" << candidates << ")";
+            logger.log(oss.str());
+            return best_edge;
+        }
+
+        static int fallback_count = 0;
+        if (++fallback_count % 20 == 0) {
+            std::ostringstream oss;
+            oss << "⚠️  find_edge_near FAIL: expected=" << expected
+                << ", range=[" << start << "," << end << "], candidates=" << candidates;
+            logger.log(oss.str());
+        }
+        return -1;
     }
 };
 
@@ -617,21 +761,23 @@ private:
     float time_div = 0.001f;
     float volt_div = 0.5f;
     TriggerMode trigger_mode = TriggerMode::AUTO;
-    
+    float trigger_level = 1.65f;  // Display trigger level line
+
 public:
     ScopeDisplay(QWidget *parent = nullptr) : QWidget(parent) {
         setMinimumSize(800, 600);
     }
-    
+
     void update_waveform(const std::vector<float>& v, const std::vector<float>& t) {
         voltage = v;
         time = t;
         update();
     }
-    
+
     void set_time_div(float div) { time_div = div; update(); }
     void set_volt_div(float div) { volt_div = div; update(); }
     void set_trigger_mode(TriggerMode mode) { trigger_mode = mode; update(); }
+    void set_trigger_level(float level) { trigger_level = level; update(); }
 
 protected:
     void paintEvent(QPaintEvent*) override {
@@ -664,18 +810,35 @@ protected:
         p.drawLine(cx, margin, cx, margin + grid_h);
         p.drawLine(margin, cy, margin + grid_w, cy);
         
-        // Trigger marker
+        // Trigger marker (vertical line at left edge)
         if (trigger_mode != TriggerMode::FREE_RUN) {
             p.setPen(QPen(QColor(255, 140, 0), 3));
             p.drawLine(margin, margin, margin, margin + grid_h);
-            
-            // Trigger arrow
+        }
+
+        // Trigger level line (horizontal line)
+        if (trigger_mode != TriggerMode::FREE_RUN) {
+            float v_center = VCC / 2.0f;
+            float v_range = volt_div * 8.0f;
+            int trig_y = cy - static_cast<int>((trigger_level - v_center) / v_range * grid_h);
+
+            // Draw trigger level line
+            p.setPen(QPen(QColor(255, 140, 0), 2, Qt::DashLine));
+            p.drawLine(margin, trig_y, margin + grid_w, trig_y);
+
+            // Draw trigger arrow pointing to level
             p.setBrush(QColor(255, 140, 0));
             QPolygon arrow;
-            arrow << QPoint(margin - 15, cy) 
-                  << QPoint(margin - 5, cy - 8) 
-                  << QPoint(margin - 5, cy + 8);
+            arrow << QPoint(margin - 15, trig_y)
+                  << QPoint(margin - 5, trig_y - 8)
+                  << QPoint(margin - 5, trig_y + 8);
             p.drawPolygon(arrow);
+
+            // Draw trigger level text
+            p.setPen(QColor(255, 140, 0));
+            p.setFont(QFont("Monospace", 11, QFont::Bold));
+            p.drawText(margin + grid_w + 5, trig_y + 5,
+                       QString("%1V").arg(trigger_level, 0, 'f', 2));
         }
         
         // Waveform
@@ -742,11 +905,15 @@ private:
     QTimer *timer;
     QButtonGroup *trigger_group;
 
+    // Debounce for trigger level adjustment
+    std::chrono::steady_clock::time_point last_trigger_adjust;
+    const int TRIGGER_ADJUST_DEBOUNCE_MS = 100;  // Minimum 100ms between adjustments
+
 public:
-    MainWindow() {
+    MainWindow() : last_trigger_adjust(std::chrono::steady_clock::now() - std::chrono::seconds(1)) {
         setWindowTitle("Professional Oscilloscope - AUTO TRIGGER");
         resize(1400, 900);
-        
+
         QVBoxLayout *main_layout = new QVBoxLayout(this);
         QHBoxLayout *top = new QHBoxLayout();
         
@@ -797,7 +964,7 @@ public:
         trigger_group->addButton(free_btn, 2);
         panel_layout->addWidget(free_btn);
         
-        connect(trigger_group, QOverload<int>::of(&QButtonGroup::buttonClicked),
+        connect(trigger_group, QOverload<int>::of(&QButtonGroup::idClicked),
                 this, &MainWindow::change_trigger_mode);
         
         panel_layout->addSpacing(20);
@@ -888,6 +1055,9 @@ private slots:
         if (reader.get_data(volt, time_vec)) {
             display->update_waveform(volt, time_vec);
         }
+
+        // Update trigger level display
+        display->set_trigger_level(reader.getTriggerLevel());
         
         TimingSnapshot snap = reader.get_stats();
         float fps_val = reader.get_fps();
@@ -904,20 +1074,25 @@ private slots:
             case TriggerMode::FREE_RUN: mode_str = "FREE RUN"; break;
         }
         
+        float trig_level = reader.getTriggerLevel();
+
         QString stats_text = QString(
             "MODE: %1\n"
             "FPS: %2\n"
             "Vpp: %3V\n"
             "Signal: %4\n\n"
-            "Total: %5\n"
-            "Good: %6\n"
-            "OK: %7%%\n\n"
-            "Triggers: %8\n"
-            "Auto↔: %9"
+            "🎯 Trigger: %5V\n"
+            "(↑↓ to adjust)\n\n"
+            "Total: %6\n"
+            "Good: %7\n"
+            "OK: %8%%\n\n"
+            "Triggers: %9\n"
+            "Auto↔: %10"
         ).arg(mode_str)
          .arg(fps_val, 0, 'f', 1)
          .arg(vpp, 0, 'f', 2)
          .arg(has_sig ? "✅" : "❌")
+         .arg(trig_level, 0, 'f', 2)
          .arg(snap.total_packets)
          .arg(snap.good_packets)
          .arg(success, 0, 'f', 1)
@@ -946,6 +1121,36 @@ private slots:
         reader.set_trigger_mode(mode);
         display->set_trigger_mode(mode);
     }
+
+protected:
+    void keyPressEvent(QKeyEvent *event) override {
+        // Only process trigger level keys with debouncing
+        if (event->key() != Qt::Key_Up && event->key() != Qt::Key_Down) {
+            QWidget::keyPressEvent(event);
+            return;
+        }
+
+        // Ignore auto-repeat for trigger adjustment
+        if (event->isAutoRepeat()) {
+            return;
+        }
+
+        // Debounce trigger level adjustment
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_trigger_adjust).count();
+
+        if (elapsed < TRIGGER_ADJUST_DEBOUNCE_MS) {
+            return;  // Too soon, ignore
+        }
+
+        if (event->key() == Qt::Key_Up) {
+            reader.increaseTriggerLevel();
+            last_trigger_adjust = now;
+        } else if (event->key() == Qt::Key_Down) {
+            reader.decreaseTriggerLevel();
+            last_trigger_adjust = now;
+        }
+    }
 };
 
 int main(int argc, char *argv[]) {
@@ -955,4 +1160,4 @@ int main(int argc, char *argv[]) {
     return app.exec();
 }
 
-#include "scope_pro.moc"
+#include "ol.moc"
