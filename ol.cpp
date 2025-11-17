@@ -843,25 +843,40 @@ protected:
         
         // Waveform
         if (!voltage.empty() && voltage.size() > 10) {
+            // Set clipping region to prevent drawing outside grid
+            p.setClipRect(margin, margin, grid_w, grid_h);
+
             p.setPen(QPen(QColor(255, 220, 0), 2));
-            
+
             float t_window = time_div * 10.0f;
             float v_center = VCC / 2.0f;
             float v_range = volt_div * 8.0f;
-            
+
             for (size_t i = 0; i < voltage.size() - 1; i++) {
                 float t1 = time[i];
                 float t2 = time[i + 1];
-                
+
+                // Skip if both points are completely outside the time window
                 if (t2 < 0 || t1 > t_window) continue;
-                
-                int x1 = margin + static_cast<int>((t1 / t_window) * grid_w);
-                int x2 = margin + static_cast<int>((t2 / t_window) * grid_w);
+
+                // Clamp time values to window bounds to prevent drawing outside
+                float t1_clamped = std::max(0.0f, std::min(t1, t_window));
+                float t2_clamped = std::max(0.0f, std::min(t2, t_window));
+
+                int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
+                int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
                 int y1 = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
                 int y2 = cy - static_cast<int>((voltage[i+1] - v_center) / v_range * grid_h);
-                
+
+                // Additional safety: clamp x coordinates to grid bounds
+                x1 = std::max(margin, std::min(x1, margin + grid_w));
+                x2 = std::max(margin, std::min(x2, margin + grid_w));
+
                 p.drawLine(x1, y1, x2, y2);
             }
+
+            // Reset clipping for subsequent drawing
+            p.setClipping(false);
             
             // Measurements
             float vmin = *std::min_element(voltage.begin(), voltage.end());
