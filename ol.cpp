@@ -166,6 +166,11 @@ private:
     // Trigger consistency - store first edge position to ensure all buffers match
     int first_edge_position = -1;
 
+    // Delayed trigger for continuous data
+    int trigger_buffer_index = -1;  // Which buffer in history contains the edge
+    int trigger_edge_position = -1;  // Edge position within that buffer
+    int buffers_since_trigger = 0;   // Count buffers after trigger detected
+
     // Learning
     std::vector<int> edge_history;
     int stable_edge_offset = -1;
@@ -582,32 +587,23 @@ private:
                             logger.log(oss.str());
                         }
 
-                        // Start collecting from edge position
-                        temp_size = 0;
-
+                        // Use SINGLE BUFFER ONLY for zero jitter and 100% continuous data
                         // Copy from edge position to end of current buffer
-                        for (int i = edge_idx; i < BUFFER_SIZE; i++) {
-                            temp_buffer[temp_size++] = voltage[i];
-                        }
+                        // This gives ~410 samples @ 600kHz = ~0.68ms of continuous waveform
 
-                        // If we have enough data already, display it
-                        if (temp_size >= CAPTURE_SIZE) {
-                            std::lock_guard<std::mutex> lock(data_mutex);
-                            for (size_t i = 0; i < temp_size; i++) {
-                                display_voltage[i] = temp_buffer[i];
-                                display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
-                            }
-                            display_size = temp_size;
-                            new_data = true;
-                            state = State::HOLDOFF;
-                            last_trigger_time = now;
-                            return true;
-                        }
+                        std::lock_guard<std::mutex> lock(data_mutex);
 
-                        // Need more data - transition to COLLECTING
-                        state = State::COLLECTING;
-                        collect_count = 1;
-                        return false;
+                        size_t samples_to_copy = BUFFER_SIZE - edge_idx;
+                        for (size_t i = 0; i < samples_to_copy; i++) {
+                            display_voltage[i] = voltage[edge_idx + i];
+                            display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                        }
+                        display_size = samples_to_copy;
+                        new_data = true;
+
+                        state = State::HOLDOFF;
+                        last_trigger_time = now;
+                        return true;
                     }
                 }
                 return false;
@@ -616,36 +612,8 @@ private:
             case State::LEARNING:  // No longer used, but keep for compatibility
             case State::TRIGGERED:
             case State::COLLECTING: {
-                // Continue collecting from subsequent buffers to reach CAPTURE_SIZE
-                if (vpp > TRIGGER_THRESHOLD) {
-                    // Collect ENTIRE buffer for continuous timeline
-                    for (size_t i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                        temp_buffer[temp_size++] = voltage[i];
-                    }
-                    collect_count++;
-                } else {
-                    // Signal lost - abort and go back to IDLE
-                    state = State::IDLE;
-                    return false;
-                }
-
-                // Check if we have enough data
-                if (temp_size >= CAPTURE_SIZE) {
-                    std::lock_guard<std::mutex> lock(data_mutex);
-
-                    size_t copy_size = std::min(temp_size, CAPTURE_SIZE);
-                    for (size_t i = 0; i < copy_size; i++) {
-                        display_voltage[i] = temp_buffer[i];
-                        display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
-                    }
-                    display_size = copy_size;
-                    new_data = true;
-
-                    state = State::HOLDOFF;
-                    last_trigger_time = now;
-                    return true;
-                }
-
+                // No longer used - all data comes from history
+                state = State::IDLE;
                 return false;
             }
         }
