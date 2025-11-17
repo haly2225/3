@@ -582,10 +582,7 @@ private:
                             logger.log(oss.str());
                         }
 
-                        // Use ONLY current buffer post-trigger data for zero jitter
-                        // This ensures 100% continuous data with no gaps between buffers
-                        std::lock_guard<std::mutex> lock(data_mutex);
-
+                        // Start collecting from edge position
                         temp_size = 0;
 
                         // Copy from edge position to end of current buffer
@@ -593,18 +590,24 @@ private:
                             temp_buffer[temp_size++] = voltage[i];
                         }
 
-                        // Copy to display
-                        for (size_t i = 0; i < temp_size; i++) {
-                            display_voltage[i] = temp_buffer[i];
-                            display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                        // If we have enough data already, display it
+                        if (temp_size >= CAPTURE_SIZE) {
+                            std::lock_guard<std::mutex> lock(data_mutex);
+                            for (size_t i = 0; i < temp_size; i++) {
+                                display_voltage[i] = temp_buffer[i];
+                                display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                            }
+                            display_size = temp_size;
+                            new_data = true;
+                            state = State::HOLDOFF;
+                            last_trigger_time = now;
+                            return true;
                         }
-                        display_size = temp_size;
-                        new_data = true;
 
-                        state = State::HOLDOFF;
-                        last_trigger_time = now;
-
-                        return true;
+                        // Need more data - transition to COLLECTING
+                        state = State::COLLECTING;
+                        collect_count = 1;
+                        return false;
                     }
                 }
                 return false;
@@ -613,9 +616,36 @@ private:
             case State::LEARNING:  // No longer used, but keep for compatibility
             case State::TRIGGERED:
             case State::COLLECTING: {
-                // Old collecting logic - no longer needed with circular buffer
-                // Just transition back to IDLE
-                state = State::IDLE;
+                // Continue collecting from subsequent buffers to reach CAPTURE_SIZE
+                if (vpp > TRIGGER_THRESHOLD) {
+                    // Collect ENTIRE buffer for continuous timeline
+                    for (size_t i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                        temp_buffer[temp_size++] = voltage[i];
+                    }
+                    collect_count++;
+                } else {
+                    // Signal lost - abort and go back to IDLE
+                    state = State::IDLE;
+                    return false;
+                }
+
+                // Check if we have enough data
+                if (temp_size >= CAPTURE_SIZE) {
+                    std::lock_guard<std::mutex> lock(data_mutex);
+
+                    size_t copy_size = std::min(temp_size, CAPTURE_SIZE);
+                    for (size_t i = 0; i < copy_size; i++) {
+                        display_voltage[i] = temp_buffer[i];
+                        display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                    }
+                    display_size = copy_size;
+                    new_data = true;
+
+                    state = State::HOLDOFF;
+                    last_trigger_time = now;
+                    return true;
+                }
+
                 return false;
             }
         }
