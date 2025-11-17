@@ -47,7 +47,7 @@ constexpr uint16_t PACKET_SIZE = 4 + BUFFER_SIZE * 2;
 constexpr float    SAMPLE_RATE = 600000.0f;
 constexpr float    VCC = 3.3f;
 constexpr uint16_t ADC_MAX = 4095;
-constexpr size_t   CAPTURE_SIZE = 1200;  // ~2ms @ 600kHz - always collect same number of samples after edge
+constexpr size_t   CAPTURE_SIZE = 2400;  // ~4ms @ 600kHz - always collect same number of samples after edge
 
 // Trigger modes
 enum class TriggerMode {
@@ -157,8 +157,8 @@ private:
     size_t temp_size = 0;
     size_t collect_count = 0;
 
-    // Circular buffer for pre-trigger data (keeps last 4 buffers = 2048 samples)
-    static constexpr int HISTORY_BUFFERS = 4;
+    // Circular buffer for pre-trigger data (keeps last 6 buffers = 3072 samples)
+    static constexpr int HISTORY_BUFFERS = 6;
     std::array<std::array<float, BUFFER_SIZE>, HISTORY_BUFFERS> buffer_history;
     int history_write_pos = 0;
     int buffers_in_history = 0;
@@ -612,12 +612,14 @@ private:
 
                 buffers_since_trigger++;
 
-                // Need 2 more buffers for full CAPTURE_SIZE (1200 samples)
+                // Need 4 more buffers for full CAPTURE_SIZE (2400 samples)
                 // Buffer with edge: ~410 samples (512 - 102)
                 // Buffer +1: 512 samples
-                // Buffer +2: ~280 samples
-                // Total: ~1200 samples
-                if (buffers_since_trigger >= 2) {
+                // Buffer +2: 512 samples
+                // Buffer +3: 512 samples
+                // Buffer +4: ~454 samples
+                // Total: ~2400 samples
+                if (buffers_since_trigger >= 4) {
                     std::lock_guard<std::mutex> lock(data_mutex);
                     temp_size = 0;
 
@@ -631,16 +633,12 @@ private:
                         temp_buffer[temp_size++] = buffer_history[buf_idx][i];
                     }
 
-                    // Buffer 1: entire buffer
-                    buf_idx = (trigger_buffer_index + 1) % HISTORY_BUFFERS;
-                    for (int i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                        temp_buffer[temp_size++] = buffer_history[buf_idx][i];
-                    }
-
-                    // Buffer 2: partial buffer until CAPTURE_SIZE
-                    buf_idx = (trigger_buffer_index + 2) % HISTORY_BUFFERS;
-                    for (int i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                        temp_buffer[temp_size++] = buffer_history[buf_idx][i];
+                    // Buffers 1-4: entire buffers until CAPTURE_SIZE reached
+                    for (int buf_offset = 1; buf_offset <= 4 && temp_size < CAPTURE_SIZE; buf_offset++) {
+                        buf_idx = (trigger_buffer_index + buf_offset) % HISTORY_BUFFERS;
+                        for (int i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
+                            temp_buffer[temp_size++] = buffer_history[buf_idx][i];
+                        }
                     }
 
                     // Copy to display
