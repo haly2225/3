@@ -195,6 +195,21 @@ private:
     int trigger_edge_position = -1;  // Edge position within that buffer
     int buffers_since_trigger = 0;   // Count buffers after trigger detected
 
+    // Phase-locked trigger state (professional oscilloscope technique)
+    struct PhaseLockedState {
+        bool enabled = true;  // Enable phase-locked mode
+        float measured_period = 0.0f;
+        int edges_found = 0;
+        std::vector<int> edge_positions;  // Store all edge positions in capture
+
+        void reset() {
+            measured_period = 0.0f;
+            edges_found = 0;
+            edge_positions.clear();
+        }
+    };
+    PhaseLockedState phase_lock;
+
     // Learning
     std::vector<int> edge_history;
     int stable_edge_offset = -1;
@@ -403,6 +418,14 @@ public:
     void set_v_offset(float offset) { v_offset = offset; }
     float get_h_offset() const { return h_offset.load(); }
     float get_v_offset() const { return v_offset.load(); }
+
+    // Phase-lock control
+    void set_phase_lock(bool enabled) {
+        phase_lock.enabled = enabled;
+        std::string status = enabled ? "ENABLED" : "DISABLED";
+        logger.log("🔒 Phase-lock: " + status);
+    }
+    bool get_phase_lock() const { return phase_lock.enabled; }
 
     void set_trigger_mode(TriggerMode mode) {
         trigger_mode = mode;
@@ -674,6 +697,7 @@ private:
 
                 if (elapsed >= HOLDOFF_MS) {
                     state = State::IDLE;
+                    phase_lock.reset();  // Reset phase lock state
                 }
                 return false;
             }
@@ -810,20 +834,19 @@ private:
                         }
                     }  // Release buffer_history_mutex lock
 
-                    // Now copy to display buffer with data_mutex lock
-                    {
+                    // **PHASE-LOCKED ALIGNMENT** - professional oscilloscope technique
+                    if (phase_lock.enabled) {
+                        apply_phase_locked_alignment();
+                    } else {
+                        // Standard copy without alignment
                         std::lock_guard<std::mutex> lock(data_mutex);
-
-                        // Copy to display - edge is ALWAYS at sample index PRE_TRIGGER_SAMPLES (100)
-                        // With tight window (±1 sample), jitter is only ±1.67µs - acceptable!
-                        // Time axis: negative before trigger (t=0), positive after
                         for (size_t i = 0; i < temp_size; i++) {
                             display_voltage[i] = temp_buffer[i];
                             display_time[i] = static_cast<float>((int)i - PRE_TRIGGER_SAMPLES) / SAMPLE_RATE;
                         }
                         display_size = temp_size;
                         new_data = true;
-                    }  // Release data_mutex lock
+                    }
 
                     // DEBUG: Show sample values at key positions
                     if (log_this_extraction) {
@@ -884,6 +907,103 @@ private:
         }
 
         return -1;  // No edge in window
+    }
+
+    // Phase-Locked Multi-Cycle Alignment - professional oscilloscope technique
+    void apply_phase_locked_alignment() {
+        // Step 1: Find all edges in captured data
+        phase_lock.edge_positions.clear();
+        phase_lock.edge_positions.push_back(PRE_TRIGGER_SAMPLES);  // First edge at trigger point
+
+        float trig_lvl = trigger_level.load();
+        TriggerSlope slope = trigger_slope.load();
+
+        // Find subsequent edges
+        for (size_t i = PRE_TRIGGER_SAMPLES + 50; i < temp_size - 1; i++) {
+            bool edge_found = false;
+
+            if (slope == TriggerSlope::RISING) {
+                edge_found = (temp_buffer[i - 1] < trig_lvl && temp_buffer[i] >= trig_lvl);
+            } else {
+                edge_found = (temp_buffer[i - 1] > trig_lvl && temp_buffer[i] <= trig_lvl);
+            }
+
+            if (edge_found) {
+                // Check minimum spacing to avoid double-triggering
+                int last_edge = phase_lock.edge_positions.back();
+                if ((int)i - last_edge > 200) {  // Minimum 200 samples between edges (~333µs)
+                    phase_lock.edge_positions.push_back(i);
+                }
+            }
+        }
+
+        phase_lock.edges_found = phase_lock.edge_positions.size();
+
+        // Step 2: Measure period from edges
+        if (phase_lock.edges_found >= 2) {
+            int total_samples = phase_lock.edge_positions.back() - phase_lock.edge_positions.front();
+            phase_lock.measured_period = static_cast<float>(total_samples) / (phase_lock.edges_found - 1);
+
+            static int period_log_count = 0;
+            if (++period_log_count % 20 == 1) {
+                std::ostringstream oss;
+                oss << "🔒 PHASE-LOCK: " << phase_lock.edges_found << " edges, "
+                    << "period=" << std::fixed << std::setprecision(1) << phase_lock.measured_period << " samples ("
+                    << std::setprecision(3) << (phase_lock.measured_period / SAMPLE_RATE * 1000.0f) << "ms)";
+                logger.log(oss.str());
+            }
+        }
+
+        // Step 3: Align each cycle to phase reference
+        std::array<float, 8192> aligned_buffer;
+        size_t aligned_size = 0;
+
+        if (phase_lock.edges_found >= 1) {
+            // Process each cycle
+            for (size_t cycle = 0; cycle < phase_lock.edge_positions.size(); cycle++) {
+                int edge_start = phase_lock.edge_positions[cycle];
+
+                // Determine cycle length
+                int cycle_length;
+                if (cycle + 1 < phase_lock.edge_positions.size()) {
+                    cycle_length = phase_lock.edge_positions[cycle + 1] - edge_start;
+                } else {
+                    // Last cycle - use measured period
+                    cycle_length = static_cast<int>(phase_lock.measured_period);
+                    if (edge_start + cycle_length > (int)temp_size) {
+                        cycle_length = temp_size - edge_start;
+                    }
+                }
+
+                // Copy this cycle to aligned buffer
+                for (int i = 0; i < cycle_length && aligned_size < aligned_buffer.size(); i++) {
+                    if (edge_start + i < (int)temp_size) {
+                        aligned_buffer[aligned_size++] = temp_buffer[edge_start + i];
+                    }
+                }
+            }
+
+            // Step 4: Copy to display buffer
+            std::lock_guard<std::mutex> lock(data_mutex);
+
+            for (size_t i = 0; i < aligned_size; i++) {
+                display_voltage[i] = aligned_buffer[i];
+                display_time[i] = static_cast<float>((int)i) / SAMPLE_RATE;
+            }
+
+            display_size = aligned_size;
+            new_data = true;
+
+        } else {
+            // Fallback: no edges found, use standard copy
+            std::lock_guard<std::mutex> lock(data_mutex);
+            for (size_t i = 0; i < temp_size; i++) {
+                display_voltage[i] = temp_buffer[i];
+                display_time[i] = static_cast<float>((int)i - PRE_TRIGGER_SAMPLES) / SAMPLE_RATE;
+            }
+            display_size = temp_size;
+            new_data = true;
+        }
     }
 
     // Old edge detection (for reference, not used)
@@ -1628,6 +1748,20 @@ public:
         connect(slope_btn, &QPushButton::clicked, this, &MainWindow::toggle_trigger_slope);
         panel_layout->addWidget(slope_btn);
 
+        // Phase-Lock control
+        QPushButton *phase_lock_btn = new QPushButton("🔒 PHASE-LOCK: ON");
+        phase_lock_btn->setCheckable(true);
+        phase_lock_btn->setChecked(true);
+        phase_lock_btn->setStyleSheet(
+            "QPushButton { background-color: #555; color: white; padding: 6px; font-weight: bold; }"
+            "QPushButton:checked { background-color: #00aa00; color: white; }"
+        );
+        connect(phase_lock_btn, &QPushButton::toggled, [this, phase_lock_btn](bool checked) {
+            reader.set_phase_lock(checked);
+            phase_lock_btn->setText(checked ? "🔒 PHASE-LOCK: ON" : "🔓 PHASE-LOCK: OFF");
+        });
+        panel_layout->addWidget(phase_lock_btn);
+
         panel_layout->addSpacing(10);
 
         // H/V Position Offset
@@ -2000,6 +2134,10 @@ protected:
             case Qt::Key_C:
                 // Clear history
                 display->clear_history();
+                return;
+            case Qt::Key_L:
+                // Toggle phase-lock
+                reader.set_phase_lock(!reader.get_phase_lock());
                 return;
 
             // Playback frame navigation
