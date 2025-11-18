@@ -910,16 +910,17 @@ private:
     }
 
     // Phase-Locked Multi-Cycle Alignment - professional oscilloscope technique
+    // Uses sub-sample interpolation to perfectly align waveform to trigger point
     void apply_phase_locked_alignment() {
-        // Step 1: Find all edges in captured data
-        phase_lock.edge_positions.clear();
-        phase_lock.edge_positions.push_back(PRE_TRIGGER_SAMPLES);  // First edge at trigger point
-
         float trig_lvl = trigger_level.load();
         TriggerSlope slope = trigger_slope.load();
 
-        // Find subsequent edges
-        for (size_t i = PRE_TRIGGER_SAMPLES + 50; i < temp_size - 1; i++) {
+        // Step 1: Find first edge in captured data with sub-sample precision
+        int first_edge_idx = -1;
+        float fractional_offset = 0.0f;
+
+        // Search for edge in captured data
+        for (size_t i = 1; i < temp_size - 1; i++) {
             bool edge_found = false;
 
             if (slope == TriggerSlope::RISING) {
@@ -929,73 +930,26 @@ private:
             }
 
             if (edge_found) {
-                // Check minimum spacing to avoid double-triggering
-                int last_edge = phase_lock.edge_positions.back();
-                if ((int)i - last_edge > 200) {  // Minimum 200 samples between edges (~333µs)
-                    phase_lock.edge_positions.push_back(i);
-                }
-            }
-        }
+                first_edge_idx = i;
 
-        phase_lock.edges_found = phase_lock.edge_positions.size();
+                // Calculate fractional position for sub-sample accuracy
+                float v0 = temp_buffer[i - 1];
+                float v1 = temp_buffer[i];
+                float delta = v1 - v0;
 
-        // Step 2: Measure period from edges
-        if (phase_lock.edges_found >= 2) {
-            int total_samples = phase_lock.edge_positions.back() - phase_lock.edge_positions.front();
-            phase_lock.measured_period = static_cast<float>(total_samples) / (phase_lock.edges_found - 1);
-
-            static int period_log_count = 0;
-            if (++period_log_count % 20 == 1) {
-                std::ostringstream oss;
-                oss << "🔒 PHASE-LOCK: " << phase_lock.edges_found << " edges, "
-                    << "period=" << std::fixed << std::setprecision(1) << phase_lock.measured_period << " samples ("
-                    << std::setprecision(3) << (phase_lock.measured_period / SAMPLE_RATE * 1000.0f) << "ms)";
-                logger.log(oss.str());
-            }
-        }
-
-        // Step 3: Align each cycle to phase reference
-        std::array<float, 8192> aligned_buffer;
-        size_t aligned_size = 0;
-
-        if (phase_lock.edges_found >= 1) {
-            // Process each cycle
-            for (size_t cycle = 0; cycle < phase_lock.edge_positions.size(); cycle++) {
-                int edge_start = phase_lock.edge_positions[cycle];
-
-                // Determine cycle length
-                int cycle_length;
-                if (cycle + 1 < phase_lock.edge_positions.size()) {
-                    cycle_length = phase_lock.edge_positions[cycle + 1] - edge_start;
+                if (std::abs(delta) > 0.001f) {
+                    fractional_offset = (trig_lvl - v0) / delta;
                 } else {
-                    // Last cycle - use measured period
-                    cycle_length = static_cast<int>(phase_lock.measured_period);
-                    if (edge_start + cycle_length > (int)temp_size) {
-                        cycle_length = temp_size - edge_start;
-                    }
+                    fractional_offset = 0.0f;
                 }
 
-                // Copy this cycle to aligned buffer
-                for (int i = 0; i < cycle_length && aligned_size < aligned_buffer.size(); i++) {
-                    if (edge_start + i < (int)temp_size) {
-                        aligned_buffer[aligned_size++] = temp_buffer[edge_start + i];
-                    }
-                }
+                fractional_offset = std::max(0.0f, std::min(1.0f, fractional_offset));
+                break;
             }
+        }
 
-            // Step 4: Copy to display buffer
-            std::lock_guard<std::mutex> lock(data_mutex);
-
-            for (size_t i = 0; i < aligned_size; i++) {
-                display_voltage[i] = aligned_buffer[i];
-                display_time[i] = static_cast<float>((int)i) / SAMPLE_RATE;
-            }
-
-            display_size = aligned_size;
-            new_data = true;
-
-        } else {
-            // Fallback: no edges found, use standard copy
+        if (first_edge_idx < 0) {
+            // No edge found - use standard copy
             std::lock_guard<std::mutex> lock(data_mutex);
             for (size_t i = 0; i < temp_size; i++) {
                 display_voltage[i] = temp_buffer[i];
@@ -1003,7 +957,47 @@ private:
             }
             display_size = temp_size;
             new_data = true;
+            return;
         }
+
+        // Step 2: Calculate total shift needed to align edge to PRE_TRIGGER_SAMPLES
+        // Edge is at (first_edge_idx - 1 + fractional_offset)
+        // We want it at PRE_TRIGGER_SAMPLES exactly
+        float actual_edge_pos = (first_edge_idx - 1) + fractional_offset;
+        float shift = actual_edge_pos - PRE_TRIGGER_SAMPLES;
+
+        static int align_log_count = 0;
+        if (++align_log_count % 20 == 1) {
+            std::ostringstream oss;
+            oss << "🔒 PHASE-LOCK: edge_idx=" << first_edge_idx
+                << " frac=" << std::fixed << std::setprecision(3) << fractional_offset
+                << " shift=" << std::setprecision(3) << shift << " samples";
+            logger.log(oss.str());
+        }
+
+        // Step 3: Apply interpolation shift to entire waveform
+        std::lock_guard<std::mutex> lock(data_mutex);
+
+        for (size_t i = 0; i < temp_size; i++) {
+            // Source position with shift applied
+            float src_pos = i + shift;
+
+            if (src_pos < 0 || src_pos >= temp_size - 1) {
+                // Out of bounds - use edge value
+                display_voltage[i] = (src_pos < 0) ? temp_buffer[0] : temp_buffer[temp_size - 1];
+            } else {
+                // Linear interpolation
+                int src_idx = static_cast<int>(src_pos);
+                float frac = src_pos - src_idx;
+
+                display_voltage[i] = temp_buffer[src_idx] * (1.0f - frac) + temp_buffer[src_idx + 1] * frac;
+            }
+
+            display_time[i] = static_cast<float>((int)i - PRE_TRIGGER_SAMPLES) / SAMPLE_RATE;
+        }
+
+        display_size = temp_size;
+        new_data = true;
     }
 
     // Old edge detection (for reference, not used)
