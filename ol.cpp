@@ -367,7 +367,10 @@ public:
     void set_running(bool run) {
         acquisition_running = run;
         if (run) {
-            logger.log("▶️  RUN");
+            // Reset single shot mode when resuming RUN
+            single_shot_mode = false;
+            single_shot_armed = false;
+            logger.log("▶️  RUN (continuous)");
         } else {
             logger.log("⏸️  STOP");
         }
@@ -1794,6 +1797,19 @@ protected:
                 last_trigger_adjust = now;
             }
             return;
+        }
+
+        // Acquisition control: R=RUN, S=STOP, Space=SINGLE
+        switch (event->key()) {
+            case Qt::Key_R:
+                reader.set_running(true);
+                return;
+            case Qt::Key_S:
+                reader.set_running(false);
+                return;
+            case Qt::Key_Space:
+                reader.arm_single_shot();
+                return;
         }
 
         QWidget::keyPressEvent(event);
