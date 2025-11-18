@@ -851,8 +851,8 @@ private:
     // Simple edge detection - like a real oscilloscope!
     // Find edge - like real oscilloscope!
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // ZERO-JITTER edge detection: ALWAYS return TARGET position if edge found
-        // This eliminates position variance completely - key to stable waveform!
+        // Simple edge detection in first 1/5 of buffer
+        // Returns ACTUAL edge position (not fixed) - this is correct behavior
         const int TARGET = BUFFER_SIZE / 5;  // 102
         const int WINDOW = 3;  // ±3 samples search window
 
@@ -876,10 +876,9 @@ private:
             }
 
             if (edge_found) {
-                // CRITICAL: Return TARGET (not actual position i) for ZERO jitter
-                // This ensures extraction ALWAYS starts from same offset
-                // Trade-off: lose ~5µs position accuracy, gain perfect stability
-                return TARGET;
+                // Return ACTUAL edge position - allows natural phase alignment
+                // Pre-trigger extraction ensures edge appears at correct display time
+                return i;
             }
         }
 
@@ -1005,10 +1004,10 @@ private:
         std::vector<float> edge_spacings;
 
         // Debounce threshold: minimum time between edges
-        // For 1kHz signal (1.013ms period), use 980us to ensure only 1 edge per cycle
+        // For 1kHz signal (1.000ms period), use 995us to ensure only 1 edge per cycle
         // This heavily filters noise/ringing that creates false zero-crossings
-        // Debug showed 4 edges in 2ms with 950us, need higher threshold
-        const float MIN_EDGE_SPACING = 980e-6f;  // 980 microseconds (max 1.02kHz)
+        // Debug showed false edges at 1.053ms with 980us, need 995us minimum
+        const float MIN_EDGE_SPACING = 995e-6f;  // 995 microseconds (max 1.005kHz)
 
         for (size_t i = 1; i < n; i++) {
             if (display_voltage[i-1] < mid_level && display_voltage[i] >= mid_level) {
