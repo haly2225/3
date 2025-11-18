@@ -47,13 +47,19 @@ constexpr uint16_t PACKET_SIZE = 4 + BUFFER_SIZE * 2;
 constexpr float    SAMPLE_RATE = 600000.0f;
 constexpr float    VCC = 3.3f;
 constexpr uint16_t ADC_MAX = 4095;
-constexpr size_t   CAPTURE_SIZE = 1200;  // ~2ms @ 600kHz - always collect same number of samples after edge
+constexpr size_t   CAPTURE_SIZE = 2400;  // ~4ms @ 600kHz - always collect same number of samples after edge
 
 // Trigger modes
 enum class TriggerMode {
     AUTO,      // Auto trigger if signal present, else free run
     NORMAL,    // Only trigger when condition met
     FREE_RUN   // Always free run
+};
+
+// Trigger slope
+enum class TriggerSlope {
+    RISING,    // Trigger on rising edge
+    FALLING    // Trigger on falling edge
 };
 
 // ============================================================================
@@ -123,6 +129,22 @@ struct TimingSnapshot {
 };
 
 // ============================================================================
+// Measurements
+// ============================================================================
+struct SignalMeasurements {
+    float frequency = 0.0f;
+    float period = 0.0f;
+    float vrms = 0.0f;
+    float vmean = 0.0f;
+    float vpp = 0.0f;
+    float vmax = 0.0f;
+    float vmin = 0.0f;
+    float duty_cycle = 0.0f;
+    float rise_time = 0.0f;   // 10% to 90% rise time
+    float fall_time = 0.0f;   // 90% to 10% fall time
+};
+
+// ============================================================================
 // SPI Reader - Professional Oscilloscope
 // ============================================================================
 class SPIReader {
@@ -131,6 +153,7 @@ private:
     std::atomic<bool> running{false};
     std::thread reader_thread;
     std::mutex data_mutex;
+    std::mutex buffer_history_mutex;  // Protect buffer_history from race conditions
     
     std::array<float, 8192> display_voltage;
     std::array<float, 8192> display_time;
@@ -157,14 +180,19 @@ private:
     size_t temp_size = 0;
     size_t collect_count = 0;
 
-    // Circular buffer for pre-trigger data (keeps last 4 buffers = 2048 samples)
-    static constexpr int HISTORY_BUFFERS = 4;
+    // Circular buffer for pre-trigger data (keeps last 6 buffers = 3072 samples)
+    static constexpr int HISTORY_BUFFERS = 6;
     std::array<std::array<float, BUFFER_SIZE>, HISTORY_BUFFERS> buffer_history;
     int history_write_pos = 0;
     int buffers_in_history = 0;
 
     // Trigger consistency - store first edge position to ensure all buffers match
     int first_edge_position = -1;
+
+    // Delayed trigger for continuous data
+    int trigger_buffer_index = -1;  // Which buffer in history contains the edge
+    int trigger_edge_position = -1;  // Edge position within that buffer
+    int buffers_since_trigger = 0;   // Count buffers after trigger detected
 
     // Learning
     std::vector<int> edge_history;
@@ -181,15 +209,34 @@ private:
     bool was_triggered = false;
 
     // Trigger level adjustment (like real oscilloscope)
-    float trigger_level = 1.65f;  // Default: mid-point of 0-3.3V
+    std::atomic<float> trigger_level{1.65f};  // Default: mid-point of 0-3.3V
     const float TRIGGER_LEVEL_STEP = 0.05f;  // 50mV steps
-    int trigger_level_changes = 0;  // Count changes for periodic logging
-    
+    std::atomic<int> trigger_level_changes{0};  // Count changes for periodic logging
+
+    // Trigger slope (rising/falling edge)
+    std::atomic<TriggerSlope> trigger_slope{TriggerSlope::RISING};
+
+    // Pre-trigger samples (show waveform BEFORE trigger point)
+    static constexpr int PRE_TRIGGER_SAMPLES = 100;  // Show 100 samples before edge
+
+    // Horizontal/Vertical position offset
+    std::atomic<float> h_offset{0.0f};  // Horizontal offset in seconds
+    std::atomic<float> v_offset{0.0f};  // Vertical offset in volts
+
+    // Acquisition control
+    std::atomic<bool> acquisition_running{true};  // RUN/STOP state
+    std::atomic<bool> single_shot_mode{false};    // Single shot trigger
+    std::atomic<bool> single_shot_armed{false};   // Armed for single shot
+
     std::chrono::steady_clock::time_point last_packet_time;
     bool first_packet_received = false;
-    
+
     DebugLogger logger;
     TimingStats stats;
+
+    // Signal measurements
+    SignalMeasurements last_measurements;
+    std::mutex measurements_mutex;
 
 public:
     SPIReader() {
@@ -200,35 +247,37 @@ public:
             buf.fill(0);
         }
     }
-    
+
     ~SPIReader() { stop(); }
 
     // Trigger level adjustment (like real oscilloscope)
     void increaseTriggerLevel() {
-        trigger_level = std::min(trigger_level + TRIGGER_LEVEL_STEP, 3.3f);
-        trigger_level_changes++;
+        float new_level = std::min(trigger_level.load() + TRIGGER_LEVEL_STEP, 3.3f);
+        trigger_level.store(new_level);
+        int changes = ++trigger_level_changes;
 
         // Only log every 4 changes (0.2V) or at max boundary
-        if (trigger_level >= 3.3f || trigger_level_changes % 4 == 0) {
+        if (new_level >= 3.3f || changes % 4 == 0) {
             std::ostringstream oss;
-            oss << "🎯 Trigger Level: " << std::fixed << std::setprecision(2) << trigger_level << "V";
+            oss << "🎯 Trigger Level: " << std::fixed << std::setprecision(2) << new_level << "V";
             logger.log(oss.str());
         }
     }
 
     void decreaseTriggerLevel() {
-        trigger_level = std::max(trigger_level - TRIGGER_LEVEL_STEP, 0.0f);
-        trigger_level_changes++;
+        float new_level = std::max(trigger_level.load() - TRIGGER_LEVEL_STEP, 0.0f);
+        trigger_level.store(new_level);
+        int changes = ++trigger_level_changes;
 
         // Only log every 4 changes (0.2V) or at min boundary
-        if (trigger_level <= 0.0f || trigger_level_changes % 4 == 0) {
+        if (new_level <= 0.0f || changes % 4 == 0) {
             std::ostringstream oss;
-            oss << "🎯 Trigger Level: " << std::fixed << std::setprecision(2) << trigger_level << "V";
+            oss << "🎯 Trigger Level: " << std::fixed << std::setprecision(2) << new_level << "V";
             logger.log(oss.str());
         }
     }
 
-    float getTriggerLevel() const { return trigger_level; }
+    float getTriggerLevel() const { return trigger_level.load(); }
 
     bool init() {
         logger.log("🔧 Init SPI...");
@@ -308,7 +357,49 @@ public:
     bool has_signal() const { return signal_present.load(); }
     float get_vpp() const { return last_vpp; }
     TriggerMode get_mode() const { return trigger_mode.load(); }
-    
+
+    SignalMeasurements get_measurements() {
+        std::lock_guard<std::mutex> lock(measurements_mutex);
+        return last_measurements;
+    }
+
+    // Acquisition control
+    void set_running(bool run) {
+        acquisition_running = run;
+        if (run) {
+            logger.log("▶️  RUN");
+        } else {
+            logger.log("⏸️  STOP");
+        }
+    }
+
+    bool is_running() const { return acquisition_running.load(); }
+
+    void arm_single_shot() {
+        single_shot_mode = true;
+        single_shot_armed = true;
+        acquisition_running = true;
+        logger.log("🎯 SINGLE SHOT ARMED");
+    }
+
+    bool is_single_shot() const { return single_shot_mode.load(); }
+    bool is_single_armed() const { return single_shot_armed.load(); }
+
+    // Trigger slope control
+    void set_trigger_slope(TriggerSlope slope) {
+        trigger_slope = slope;
+        std::string slope_str = (slope == TriggerSlope::RISING) ? "↗️ RISING" : "↘️ FALLING";
+        logger.log(slope_str + " EDGE");
+    }
+
+    TriggerSlope get_trigger_slope() const { return trigger_slope.load(); }
+
+    // Horizontal/Vertical offset
+    void set_h_offset(float offset) { h_offset = offset; }
+    void set_v_offset(float offset) { v_offset = offset; }
+    float get_h_offset() const { return h_offset.load(); }
+    float get_v_offset() const { return v_offset.load(); }
+
     void set_trigger_mode(TriggerMode mode) {
         trigger_mode = mode;
         // Don't reset state - allow seamless mode switching!
@@ -395,17 +486,17 @@ private:
                 break;
             }
         }
-        
+
         if (marker_pos < 0) return false;
-        
-        uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) | 
+
+        uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
-        
+
         if (!frame_initialized) {
             frame_initialized = true;
             logger.log("📍 Sync OK");
         }
-        
+
         // Parse ADC
         std::array<uint16_t, BUFFER_SIZE> samples;
         for (size_t i = 0; i < BUFFER_SIZE; i++) {
@@ -414,11 +505,21 @@ private:
             if (val > ADC_MAX) return false;
             samples[i] = val;
         }
-        
+
         // Convert to voltage
         std::array<float, BUFFER_SIZE> voltage;
         for (size_t i = 0; i < BUFFER_SIZE; i++) {
             voltage[i] = samples[i] * (VCC / ADC_MAX);
+        }
+
+        // Store in circular buffer history for continuous data
+        {
+            std::lock_guard<std::mutex> lock(buffer_history_mutex);
+            buffer_history[history_write_pos] = voltage;
+            history_write_pos = (history_write_pos + 1) % HISTORY_BUFFERS;
+            if (buffers_in_history < HISTORY_BUFFERS) {
+                buffers_in_history++;
+            }
         }
         
         // Measure Vpp
@@ -444,17 +545,32 @@ private:
             signal_present = true;
             last_signal_time = std::chrono::steady_clock::now();
         }
-        
+
+        // Check if acquisition is running (RUN/STOP control)
+        if (!acquisition_running.load()) {
+            return false;  // STOP - don't update display
+        }
+
         // Route to appropriate handler
         TriggerMode mode = trigger_mode.load();
-        
+
+        bool triggered = false;
         if (mode == TriggerMode::FREE_RUN) {
-            return handle_free_run(voltage);
+            triggered = handle_free_run(voltage);
         } else if (mode == TriggerMode::NORMAL) {
-            return handle_normal_trigger(voltage, frame_num, vpp);
+            triggered = handle_normal_trigger(voltage, frame_num, vpp);
         } else { // AUTO
-            return handle_auto_trigger(voltage, frame_num, vpp);
+            triggered = handle_auto_trigger(voltage, frame_num, vpp);
         }
+
+        // Handle single shot mode
+        if (triggered && single_shot_mode.load() && single_shot_armed.load()) {
+            single_shot_armed = false;
+            acquisition_running = false;
+            logger.log("🎯 SINGLE SHOT TRIGGERED - STOPPED");
+        }
+
+        return triggered;
     }
     
     bool handle_free_run(const std::array<float, BUFFER_SIZE>& voltage) {
@@ -560,14 +676,10 @@ private:
 
             case State::IDLE: {
                 // Find rising edge and trigger
-                if (vpp > TRIGGER_THRESHOLD) {
+                if (vpp > TRIGGER_THRESHOLD && buffers_in_history >= HISTORY_BUFFERS) {
                     int edge_idx = find_simple_edge(voltage);
 
                     if (edge_idx >= 0) {
-                        // Edge found in window - start capture from ACTUAL edge position
-                        // This ensures edge always appears at SAME position in display (position 0)
-                        const int TARGET_EDGE_POS_IN_DISPLAY = 0;
-
                         stats.trigger_count++;
 
                         // Log only every 20 triggers to reduce spam
@@ -575,27 +687,18 @@ private:
                         if (++trigger_log_count % 20 == 1) {
                             std::ostringstream oss;
                             oss << "🎯 TRIGGER! edge=" << edge_idx
-                                << " @" << TARGET_EDGE_POS_IN_DISPLAY << " in display"
                                 << ", vpp=" << std::fixed << std::setprecision(2) << vpp << "V";
                             logger.log(oss.str());
                         }
 
-                        // Start capture from ACTUAL edge position (not fixed TARGET)
-                        // This ensures edge always appears at display position 0
-                        temp_size = 0;
-
-                        // Copy from ACTUAL edge position onwards
-                        for (int i = edge_idx; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                            temp_buffer[temp_size++] = voltage[i];
-                        }
-
-                        // Store edge position for subsequent buffers
-                        first_edge_position = edge_idx;
+                        // DELAYED TRIGGER: Save trigger info and wait for more buffers
+                        // This allows us to collect full 1200 samples from history
+                        trigger_buffer_index = (history_write_pos - 1 + HISTORY_BUFFERS) % HISTORY_BUFFERS;
+                        trigger_edge_position = edge_idx;
+                        buffers_since_trigger = 0;
 
                         state = State::COLLECTING;
-                        collect_count = 1;
-
-                        return false;  // Continue collecting
+                        return false;
                     }
                 }
                 return false;
@@ -604,58 +707,180 @@ private:
             case State::LEARNING:  // No longer used, but keep for compatibility
             case State::TRIGGERED:
             case State::COLLECTING: {
-                // Collect continuation data - collect ENTIRE buffer for continuous timeline
-                if (vpp > TRIGGER_THRESHOLD) {
-                    // Valid signal - collect ENTIRE buffer (0-511) for continuous data
-                    // First buffer started at edge position, subsequent buffers continue timeline
-                    for (size_t i = 0; i < BUFFER_SIZE && temp_size < CAPTURE_SIZE; i++) {
-                        temp_buffer[temp_size++] = voltage[i];
-                    }
-                    collect_count++;
-                } else {
-                    // No signal - skip
+                // Wait for 2 more buffers after trigger, then extract from history
+                if (vpp < TRIGGER_THRESHOLD) {
+                    // Signal lost - abort
+                    state = State::IDLE;
                     return false;
                 }
 
-                if (temp_size >= CAPTURE_SIZE) {
-                    std::lock_guard<std::mutex> lock(data_mutex);
+                buffers_since_trigger++;
 
-                    size_t copy_size = std::min(temp_size, CAPTURE_SIZE);
-                    for (size_t i = 0; i < copy_size; i++) {
-                        display_voltage[i] = temp_buffer[i];
-                        display_time[i] = static_cast<float>(i) / SAMPLE_RATE;
+                // Need 2400 samples = 4.6875 buffers (2400/512)
+                // CRITICAL FIX: Wait only 3 buffers to prevent circular buffer wraparound
+                // With HISTORY_BUFFERS=6, waiting 5+ buffers causes trigger buffer to be overwritten!
+                //
+                // Trigger buffer (index 0): ~410 samples (512 - 102)
+                // Buffer +1 (index 1): 512 samples (total: 922)
+                // Buffer +2 (index 2): 512 samples (total: 1434)
+                // Buffer +3 (index 3): 512 samples (total: 1946)
+                // Buffer +4 (index 4): 454 samples (total: 2400)
+                //
+                // After 3 buffer arrivals, we have buffers 0,1,2,3 in history
+                // After 4 buffer arrivals, we have buffers 0,1,2,3,4 in history (enough!)
+                // After 5 buffer arrivals, history_write_pos wraps and overwrites buffer 0!
+                if (buffers_since_trigger >= 4) {
+                    // Extract data from circular buffer history with proper locking
+                    temp_size = 0;
+                    std::vector<int> buffers_used;
+                    std::vector<int> samples_per_buffer;
+                    bool log_this_extraction = false;
+
+                    {
+                        // Lock buffer_history to prevent race conditions during extraction
+                        std::lock_guard<std::mutex> lock(buffer_history_mutex);
+
+                        // CORRECTED EXTRACTION - Start exactly PRE_TRIGGER_SAMPLES before edge
+                        // Edge at position trigger_edge_position → start 100 samples before it
+                        // This ensures edge ALWAYS appears at index 100 in display buffer
+
+                        int start_buf_idx;
+                        int start_pos;
+
+                        if (trigger_edge_position >= PRE_TRIGGER_SAMPLES) {
+                            // Edge is far enough in buffer, start in same buffer
+                            start_buf_idx = trigger_buffer_index;
+                            start_pos = trigger_edge_position - PRE_TRIGGER_SAMPLES;
+                        } else {
+                            // Edge is near start of buffer, need to start in previous buffer
+                            start_buf_idx = (trigger_buffer_index - 1 + HISTORY_BUFFERS) % HISTORY_BUFFERS;
+                            start_pos = BUFFER_SIZE - (PRE_TRIGGER_SAMPLES - trigger_edge_position);
+                        }
+
+                        // DEBUG: Track extraction details
+                        static int extract_log_count = 0;
+                        log_this_extraction = (++extract_log_count % 10 == 1);
+
+                        if (log_this_extraction) {
+                            std::ostringstream oss;
+                            oss << "🔧 EXTRACT START: edge_pos=" << trigger_edge_position
+                                << " start_buf=" << start_buf_idx
+                                << " start_pos=" << start_pos
+                                << " trigger_buf=" << trigger_buffer_index;
+                            logger.log(oss.str());
+                        }
+
+                        // Extract samples starting from calculated position
+                        int buf_idx = start_buf_idx;
+                        int pos = start_pos;
+                        int current_buf = buf_idx;
+                        int samples_from_current = 0;
+
+                        while (temp_size < CAPTURE_SIZE) {
+                            temp_buffer[temp_size++] = buffer_history[buf_idx][pos++];
+                            samples_from_current++;
+
+                            // Move to next buffer when current buffer ends
+                            if (pos >= BUFFER_SIZE) {
+                                if (log_this_extraction) {
+                                    buffers_used.push_back(current_buf);
+                                    samples_per_buffer.push_back(samples_from_current);
+                                }
+
+                                pos = 0;
+                                buf_idx = (buf_idx + 1) % HISTORY_BUFFERS;
+                                current_buf = buf_idx;
+                                samples_from_current = 0;
+                            }
+                        }
+
+                        // Log last buffer
+                        if (log_this_extraction && samples_from_current > 0) {
+                            buffers_used.push_back(current_buf);
+                            samples_per_buffer.push_back(samples_from_current);
+
+                            std::ostringstream oss;
+                            oss << "📦 BUFFERS: ";
+                            for (size_t i = 0; i < buffers_used.size(); i++) {
+                                oss << "buf[" << buffers_used[i] << "]=" << samples_per_buffer[i] << " ";
+                            }
+                            oss << "total=" << temp_size;
+                            logger.log(oss.str());
+                        }
+                    }  // Release buffer_history_mutex lock
+
+                    // Now copy to display buffer with data_mutex lock
+                    {
+                        std::lock_guard<std::mutex> lock(data_mutex);
+
+                        // Copy to display - edge is ALWAYS at sample index PRE_TRIGGER_SAMPLES (100)
+                        // Time axis: negative before trigger (t=0), positive after
+                        for (size_t i = 0; i < temp_size; i++) {
+                            display_voltage[i] = temp_buffer[i];
+                            display_time[i] = static_cast<float>((int)i - PRE_TRIGGER_SAMPLES) / SAMPLE_RATE;
+                        }
+                        display_size = temp_size;
+                        new_data = true;
+                    }  // Release data_mutex lock
+
+                    // DEBUG: Show sample values at key positions
+                    if (log_this_extraction) {
+                        std::ostringstream oss;
+                        oss << "📊 SAMPLES: edge[100]=" << std::fixed << std::setprecision(2) << temp_buffer[100]
+                            << "V, last_4cycles[" << (temp_size - 600) << "-" << (temp_size - 1) << "]: "
+                            << "start=" << temp_buffer[temp_size - 600] << "V "
+                            << "mid=" << temp_buffer[temp_size - 300] << "V "
+                            << "end=" << temp_buffer[temp_size - 1] << "V";
+                        logger.log(oss.str());
                     }
-                    display_size = copy_size;
-                    new_data = true;
-
-                    // Reset edge position tracker for next capture
-                    first_edge_position = -1;
 
                     state = State::HOLDOFF;
                     last_trigger_time = now;
 
+                    // Calculate measurements for new waveform (outside data_mutex lock)
+                    calculate_measurements();
+
                     return true;
                 }
-                break;
+
+                return false;
             }
         }
 
         return false;
     }
-    
+
     // Simple edge detection - like a real oscilloscope!
     // Find edge - like real oscilloscope!
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // Search window for good trigger rate, return ACTUAL edge position for zero jitter
-        // Position: 20% of buffer (102) ±2 samples
+        // STRICT edge detection: ONLY accept edge very close to target
+        // Narrow window eliminates jitter like a real oscilloscope
         const int TARGET = BUFFER_SIZE / 5;  // 102
-        const int WINDOW = 2;  // ±2 samples
+        const int WINDOW = 1;  // ±1 sample ONLY (very strict!)
 
-        // Check for rising edge in window 100-104
-        for (int i = TARGET - WINDOW; i <= TARGET + WINDOW; i++) {
-            if (voltage[i - 1] < trigger_level && voltage[i] >= trigger_level) {
+        // Bounds checking to prevent array access errors
+        int start = std::max(1, TARGET - WINDOW);  // Ensure i-1 >= 0
+        int end = std::min((int)BUFFER_SIZE - 1, TARGET + WINDOW);
+
+        float trig_lvl = trigger_level.load();
+        TriggerSlope slope = trigger_slope.load();
+
+        // Search for edge in window - return ACTUAL position
+        // Extraction code will normalize it to eliminate jitter
+        for (int i = start; i <= end; i++) {
+            bool edge_found = false;
+
+            if (slope == TriggerSlope::RISING) {
+                // Rising edge: voltage crosses trigger level upward
+                edge_found = (voltage[i - 1] < trig_lvl && voltage[i] >= trig_lvl);
+            } else {
+                // Falling edge: voltage crosses trigger level downward
+                edge_found = (voltage[i - 1] > trig_lvl && voltage[i] <= trig_lvl);
+            }
+
+            if (edge_found) {
                 // Return ACTUAL edge position (not TARGET)
-                // This ensures edge always appears at same display position (start of waveform)
+                // Extraction will adjust offset so edge appears at same display position
                 return i;
             }
         }
@@ -747,6 +972,160 @@ private:
         }
         return -1;
     }
+
+    // Calculate signal measurements from current display buffer
+    void calculate_measurements() {
+        std::lock_guard<std::mutex> lock(data_mutex);
+        size_t n = display_size.load();
+        if (n < 10) return;
+
+        // Basic measurements
+        float vmin = 3.3f, vmax = 0.0f;
+        float sum = 0.0f, sum_sq = 0.0f;
+
+        for (size_t i = 0; i < n; i++) {
+            float v = display_voltage[i];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+            sum += v;
+            sum_sq += v * v;
+        }
+
+        float vmean = sum / n;
+        float vrms = std::sqrt(sum_sq / n);
+        float vpp = vmax - vmin;
+
+        // Frequency measurement - count zero crossings at mid-point with debounce
+        float mid_level = (vmax + vmin) / 2.0f;
+        int rising_edges = 0;
+        float first_edge_time = -1.0f;
+        float last_edge_time = -1.0f;
+        float prev_edge_time = -999.0f;  // Initialize to very old time
+
+        // DEBUG: Track edge spacings for analysis
+        std::vector<float> edge_times;
+        std::vector<float> edge_spacings;
+
+        // Debounce threshold: minimum time between edges
+        // For 1kHz signal (1ms period), use 950us to ensure only 1 edge per cycle
+        // This heavily filters noise/ringing that creates false zero-crossings
+        // Debug showed false edges at 800-913us intervals, so 950us filters them out
+        const float MIN_EDGE_SPACING = 950e-6f;  // 950 microseconds (max 1.05kHz)
+
+        for (size_t i = 1; i < n; i++) {
+            if (display_voltage[i-1] < mid_level && display_voltage[i] >= mid_level) {
+                float edge_time = display_time[i];
+
+                // Only count edge if it's far enough from previous edge (debounce)
+                if (edge_time - prev_edge_time > MIN_EDGE_SPACING) {
+                    rising_edges++;
+                    if (first_edge_time < 0) {
+                        first_edge_time = edge_time;
+                    }
+                    last_edge_time = edge_time;
+
+                    // Track for debugging
+                    edge_times.push_back(edge_time);
+                    if (prev_edge_time > -999.0f) {
+                        edge_spacings.push_back(edge_time - prev_edge_time);
+                    }
+
+                    prev_edge_time = edge_time;
+                }
+            }
+        }
+
+        float frequency = 0.0f;
+        float period = 0.0f;
+        if (rising_edges >= 2 && last_edge_time > first_edge_time) {
+            period = (last_edge_time - first_edge_time) / (rising_edges - 1);
+            frequency = 1.0f / period;
+
+            // DEBUG: Log frequency measurement details
+            static int freq_log_count = 0;
+            if (++freq_log_count % 10 == 1) {
+                std::ostringstream oss;
+                oss << "📊 FREQ: edges=" << rising_edges
+                    << " period=" << std::fixed << std::setprecision(6) << period
+                    << "s freq=" << std::setprecision(1) << frequency << "Hz"
+                    << " time_span=" << std::setprecision(6) << (last_edge_time - first_edge_time) << "s";
+                logger.log(oss.str());
+
+                // Show individual edge spacings to diagnose frequency issue
+                if (!edge_spacings.empty()) {
+                    std::ostringstream oss2;
+                    oss2 << "⏱️  PERIODS: ";
+                    for (size_t i = 0; i < std::min(edge_spacings.size(), size_t(5)); i++) {
+                        oss2 << std::fixed << std::setprecision(3) << (edge_spacings[i] * 1000.0f) << "ms ";
+                    }
+                    if (edge_spacings.size() > 5) {
+                        oss2 << "... (showing first 5 of " << edge_spacings.size() << ")";
+                    }
+                    logger.log(oss2.str());
+                }
+            }
+        }
+
+        // Duty cycle - time above mid-level
+        int samples_high = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (display_voltage[i] > mid_level) {
+                samples_high++;
+            }
+        }
+        float duty_cycle = (float)samples_high / n * 100.0f;
+
+        // Rise/Fall time measurement (10% to 90%)
+        float rise_time = 0.0f;
+        float fall_time = 0.0f;
+        float v10 = vmin + 0.1f * vpp;
+        float v90 = vmin + 0.9f * vpp;
+
+        // Find first rising edge (10% to 90%)
+        int rise_start = -1, rise_end = -1;
+        for (size_t i = 1; i < n; i++) {
+            if (rise_start < 0 && display_voltage[i-1] < v10 && display_voltage[i] >= v10) {
+                rise_start = i;
+            }
+            if (rise_start >= 0 && rise_end < 0 && display_voltage[i-1] < v90 && display_voltage[i] >= v90) {
+                rise_end = i;
+                break;
+            }
+        }
+        if (rise_start >= 0 && rise_end > rise_start) {
+            rise_time = (rise_end - rise_start) / SAMPLE_RATE;
+        }
+
+        // Find first falling edge (90% to 10%)
+        int fall_start = -1, fall_end = -1;
+        for (size_t i = 1; i < n; i++) {
+            if (fall_start < 0 && display_voltage[i-1] > v90 && display_voltage[i] <= v90) {
+                fall_start = i;
+            }
+            if (fall_start >= 0 && fall_end < 0 && display_voltage[i-1] > v10 && display_voltage[i] <= v10) {
+                fall_end = i;
+                break;
+            }
+        }
+        if (fall_start >= 0 && fall_end > fall_start) {
+            fall_time = (fall_end - fall_start) / SAMPLE_RATE;
+        }
+
+        // Store measurements
+        {
+            std::lock_guard<std::mutex> mlock(measurements_mutex);
+            last_measurements.frequency = frequency;
+            last_measurements.period = period;
+            last_measurements.vrms = vrms;
+            last_measurements.vmean = vmean;
+            last_measurements.vpp = vpp;
+            last_measurements.vmax = vmax;
+            last_measurements.vmin = vmin;
+            last_measurements.duty_cycle = duty_cycle;
+            last_measurements.rise_time = rise_time;
+            last_measurements.fall_time = fall_time;
+        }
+    }
 };
 
 // ============================================================================
@@ -754,7 +1133,7 @@ private:
 // ============================================================================
 class ScopeDisplay : public QWidget {
     Q_OBJECT
-    
+
 private:
     std::vector<float> voltage;
     std::vector<float> time;
@@ -762,6 +1141,10 @@ private:
     float volt_div = 0.5f;
     TriggerMode trigger_mode = TriggerMode::AUTO;
     float trigger_level = 1.65f;  // Display trigger level line
+    SignalMeasurements measurements;
+    float h_offset = 0.0f;  // Horizontal offset
+    float v_offset = 0.0f;  // Vertical offset
+    TriggerSlope trigger_slope = TriggerSlope::RISING;
 
 public:
     ScopeDisplay(QWidget *parent = nullptr) : QWidget(parent) {
@@ -778,11 +1161,16 @@ public:
     void set_volt_div(float div) { volt_div = div; update(); }
     void set_trigger_mode(TriggerMode mode) { trigger_mode = mode; update(); }
     void set_trigger_level(float level) { trigger_level = level; update(); }
+    void set_measurements(const SignalMeasurements& m) { measurements = m; update(); }
+    void set_h_offset(float offset) { h_offset = offset; update(); }
+    void set_v_offset(float offset) { v_offset = offset; update(); }
+    void set_trigger_slope(TriggerSlope slope) { trigger_slope = slope; update(); }
 
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
-        p.setRenderHint(QPainter::Antialiasing);
+        // Disable antialiasing for performance (reduce lag)
+        // p.setRenderHint(QPainter::Antialiasing);
         
         int w = width();
         int h = height();
@@ -810,15 +1198,41 @@ protected:
         p.drawLine(cx, margin, cx, margin + grid_h);
         p.drawLine(margin, cy, margin + grid_w, cy);
         
-        // Trigger marker (vertical line at left edge)
+        // Trigger marker (vertical line at trigger point t=0)
         if (trigger_mode != TriggerMode::FREE_RUN) {
-            p.setPen(QPen(QColor(255, 140, 0), 3));
-            p.drawLine(margin, margin, margin, margin + grid_h);
+            // Calculate where t=0 (trigger point) is on screen with h_offset
+            float t_window = time_div * 10.0f;
+            float trigger_x_pos = (0.0f - h_offset) / t_window;  // t=0 with offset
+            int trigger_x = margin + static_cast<int>(trigger_x_pos * grid_w);
+
+            // Draw trigger marker at t=0 position
+            if (trigger_x >= margin && trigger_x <= margin + grid_w) {
+                p.setPen(QPen(QColor(255, 140, 0), 3));
+                p.drawLine(trigger_x, margin, trigger_x, margin + grid_h);
+
+                // Draw slope indicator arrow
+                p.setBrush(QColor(255, 140, 0));
+                QPolygon slope_arrow;
+                int arrow_x = trigger_x - 20;
+                int arrow_y = margin + 30;
+                if (trigger_slope == TriggerSlope::RISING) {
+                    // Up arrow for rising
+                    slope_arrow << QPoint(arrow_x, arrow_y + 10)
+                                << QPoint(arrow_x + 10, arrow_y)
+                                << QPoint(arrow_x + 20, arrow_y + 10);
+                } else {
+                    // Down arrow for falling
+                    slope_arrow << QPoint(arrow_x, arrow_y)
+                                << QPoint(arrow_x + 10, arrow_y + 10)
+                                << QPoint(arrow_x + 20, arrow_y);
+                }
+                p.drawPolygon(slope_arrow);
+            }
         }
 
         // Trigger level line (horizontal line)
         if (trigger_mode != TriggerMode::FREE_RUN) {
-            float v_center = VCC / 2.0f;
+            float v_center = VCC / 2.0f + v_offset;
             float v_range = volt_div * 8.0f;
             int trig_y = cy - static_cast<int>((trigger_level - v_center) / v_range * grid_h);
 
@@ -840,39 +1254,116 @@ protected:
             p.drawText(margin + grid_w + 5, trig_y + 5,
                        QString("%1V").arg(trigger_level, 0, 'f', 2));
         }
-        
+
         // Waveform
         if (!voltage.empty() && voltage.size() > 10) {
+            // Set clipping region to prevent drawing outside grid
+            p.setClipRect(margin, margin, grid_w, grid_h);
+
             p.setPen(QPen(QColor(255, 220, 0), 2));
-            
+
             float t_window = time_div * 10.0f;
-            float v_center = VCC / 2.0f;
+            float v_center = VCC / 2.0f + v_offset;  // Apply vertical offset
             float v_range = volt_div * 8.0f;
-            
+
             for (size_t i = 0; i < voltage.size() - 1; i++) {
-                float t1 = time[i];
-                float t2 = time[i + 1];
-                
+                // Apply horizontal offset to time values
+                float t1 = time[i] - h_offset;
+                float t2 = time[i + 1] - h_offset;
+
+                // Skip if both points are completely outside the time window
                 if (t2 < 0 || t1 > t_window) continue;
-                
-                int x1 = margin + static_cast<int>((t1 / t_window) * grid_w);
-                int x2 = margin + static_cast<int>((t2 / t_window) * grid_w);
+
+                // Clamp time values to window bounds to prevent drawing outside
+                float t1_clamped = std::max(0.0f, std::min(t1, t_window));
+                float t2_clamped = std::max(0.0f, std::min(t2, t_window));
+
+                int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
+                int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
                 int y1 = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
                 int y2 = cy - static_cast<int>((voltage[i+1] - v_center) / v_range * grid_h);
-                
+
+                // Additional safety: clamp x coordinates to grid bounds
+                x1 = std::max(margin, std::min(x1, margin + grid_w));
+                x2 = std::max(margin, std::min(x2, margin + grid_w));
+
                 p.drawLine(x1, y1, x2, y2);
             }
-            
-            // Measurements
-            float vmin = *std::min_element(voltage.begin(), voltage.end());
-            float vmax = *std::max_element(voltage.begin(), voltage.end());
-            
+
+            // Reset clipping for subsequent drawing
+            p.setClipping(false);
+
+            // Measurements - show comprehensive signal info
             p.setPen(QColor(255, 255, 100));
             p.setFont(QFont("Monospace", 11, QFont::Bold));
-            p.drawText(10, 30, QString("N: %1").arg(voltage.size()));
-            p.drawText(10, 50, QString("Vpp: %1V").arg(vmax - vmin, 0, 'f', 2));
-            p.drawText(10, 70, QString("Max: %1V").arg(vmax, 0, 'f', 2));
-            p.drawText(10, 90, QString("Min: %1V").arg(vmin, 0, 'f', 2));
+
+            int y_pos = 30;
+            p.drawText(10, y_pos, QString("N: %1").arg(voltage.size()));
+            y_pos += 20;
+
+            // Frequency display
+            if (measurements.frequency > 0) {
+                QString freq_str;
+                if (measurements.frequency >= 1000.0f) {
+                    freq_str = QString("Freq: %1kHz").arg(measurements.frequency / 1000.0f, 0, 'f', 2);
+                } else {
+                    freq_str = QString("Freq: %1Hz").arg(measurements.frequency, 0, 'f', 1);
+                }
+                p.drawText(10, y_pos, freq_str);
+                y_pos += 20;
+
+                // Period display
+                QString period_str;
+                if (measurements.period < 0.001f) {
+                    period_str = QString("T: %1µs").arg(measurements.period * 1e6f, 0, 'f', 1);
+                } else {
+                    period_str = QString("T: %1ms").arg(measurements.period * 1000.0f, 0, 'f', 3);
+                }
+                p.drawText(10, y_pos, period_str);
+                y_pos += 20;
+            }
+
+            p.drawText(10, y_pos, QString("Vpp: %1V").arg(measurements.vpp, 0, 'f', 2));
+            y_pos += 20;
+            p.drawText(10, y_pos, QString("Max: %1V").arg(measurements.vmax, 0, 'f', 2));
+            y_pos += 20;
+            p.drawText(10, y_pos, QString("Min: %1V").arg(measurements.vmin, 0, 'f', 2));
+            y_pos += 20;
+            p.drawText(10, y_pos, QString("Mean: %1V").arg(measurements.vmean, 0, 'f', 2));
+            y_pos += 20;
+            p.drawText(10, y_pos, QString("RMS: %1V").arg(measurements.vrms, 0, 'f', 2));
+            y_pos += 20;
+
+            if (measurements.frequency > 0) {
+                p.drawText(10, y_pos, QString("Duty: %1%").arg(measurements.duty_cycle, 0, 'f', 1));
+                y_pos += 20;
+            }
+
+            // Rise/Fall time
+            if (measurements.rise_time > 0) {
+                QString rise_str;
+                if (measurements.rise_time < 1e-6f) {
+                    rise_str = QString("Rise: %1ns").arg(measurements.rise_time * 1e9f, 0, 'f', 1);
+                } else if (measurements.rise_time < 1e-3f) {
+                    rise_str = QString("Rise: %1µs").arg(measurements.rise_time * 1e6f, 0, 'f', 2);
+                } else {
+                    rise_str = QString("Rise: %1ms").arg(measurements.rise_time * 1e3f, 0, 'f', 3);
+                }
+                p.drawText(10, y_pos, rise_str);
+                y_pos += 20;
+            }
+
+            if (measurements.fall_time > 0) {
+                QString fall_str;
+                if (measurements.fall_time < 1e-6f) {
+                    fall_str = QString("Fall: %1ns").arg(measurements.fall_time * 1e9f, 0, 'f', 1);
+                } else if (measurements.fall_time < 1e-3f) {
+                    fall_str = QString("Fall: %1µs").arg(measurements.fall_time * 1e6f, 0, 'f', 2);
+                } else {
+                    fall_str = QString("Fall: %1ms").arg(measurements.fall_time * 1e3f, 0, 'f', 3);
+                }
+                p.drawText(10, y_pos, fall_str);
+            }
         } else {
             // No signal
             p.setPen(QColor(150, 150, 150));
@@ -896,7 +1387,7 @@ protected:
 // ============================================================================
 class MainWindow : public QWidget {
     Q_OBJECT
-    
+
 private:
     SPIReader reader;
     ScopeDisplay *display;
@@ -904,6 +1395,10 @@ private:
     QTextEdit *debug_log;
     QTimer *timer;
     QButtonGroup *trigger_group;
+    QPushButton *run_stop_btn;
+    QPushButton *single_btn;
+    QPushButton *slope_btn;
+    QLabel *offset_label;
 
     // Debounce for trigger level adjustment
     std::chrono::steady_clock::time_point last_trigger_adjust;
@@ -916,19 +1411,72 @@ public:
 
         QVBoxLayout *main_layout = new QVBoxLayout(this);
         QHBoxLayout *top = new QHBoxLayout();
-        
+
         display = new ScopeDisplay();
         top->addWidget(display, 3);
-        
+
         // Control Panel
         QWidget *panel = new QWidget();
         panel->setStyleSheet("background-color: #2a2a2a;");
         panel->setFixedWidth(220);
-        
+
         QVBoxLayout *panel_layout = new QVBoxLayout(panel);
         panel_layout->setSpacing(10);
         panel_layout->setContentsMargins(10, 10, 10, 10);
-        
+
+        // RUN/STOP and SINGLE buttons
+        QLabel *acq_label = new QLabel("ACQUISITION");
+        acq_label->setStyleSheet("color: #00ff00; font-weight: bold; font-size: 14px;");
+        panel_layout->addWidget(acq_label);
+
+        run_stop_btn = new QPushButton("▶️ RUN");
+        run_stop_btn->setStyleSheet(
+            "QPushButton { background-color: #00aa00; color: white; padding: 10px; font-weight: bold; font-size: 14px; }"
+        );
+        connect(run_stop_btn, &QPushButton::clicked, this, &MainWindow::toggle_run_stop);
+        panel_layout->addWidget(run_stop_btn);
+
+        single_btn = new QPushButton("🎯 SINGLE");
+        single_btn->setStyleSheet(
+            "QPushButton { background-color: #aa5500; color: white; padding: 8px; font-weight: bold; }"
+        );
+        connect(single_btn, &QPushButton::clicked, this, &MainWindow::arm_single_shot);
+        panel_layout->addWidget(single_btn);
+
+        panel_layout->addSpacing(10);
+
+        // Trigger Slope
+        slope_btn = new QPushButton("↗️ RISING");
+        slope_btn->setStyleSheet(
+            "QPushButton { background-color: #555; color: white; padding: 8px; font-weight: bold; }"
+        );
+        connect(slope_btn, &QPushButton::clicked, this, &MainWindow::toggle_trigger_slope);
+        panel_layout->addWidget(slope_btn);
+
+        panel_layout->addSpacing(10);
+
+        // H/V Position Offset
+        QLabel *pos_label = new QLabel("POSITION");
+        pos_label->setStyleSheet("color: #00ffff; font-weight: bold;");
+        panel_layout->addWidget(pos_label);
+
+        offset_label = new QLabel("H: 0µs  V: 0.0V");
+        offset_label->setStyleSheet("color: #00ffff; font-size: 10px;");
+        panel_layout->addWidget(offset_label);
+
+        QPushButton *reset_pos_btn = new QPushButton("Reset Position");
+        reset_pos_btn->setStyleSheet("background-color: #555; color: white; padding: 4px;");
+        connect(reset_pos_btn, &QPushButton::clicked, [this]() {
+            reader.set_h_offset(0.0f);
+            reader.set_v_offset(0.0f);
+            display->set_h_offset(0.0f);
+            display->set_v_offset(0.0f);
+            update_offset_label();
+        });
+        panel_layout->addWidget(reset_pos_btn);
+
+        panel_layout->addSpacing(15);
+
         // Trigger Mode
         QLabel *trig_label = new QLabel("TRIGGER MODE");
         trig_label->setStyleSheet("color: #ff8800; font-weight: bold; font-size: 14px;");
@@ -1042,7 +1590,7 @@ public:
         
         timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, &MainWindow::update_display);
-        timer->start(50);
+        timer->start(60);  // 60ms = ~16.7 FPS (reduce from 50ms for less lag)
     }
     
     ~MainWindow() {
@@ -1058,7 +1606,10 @@ private slots:
 
         // Update trigger level display
         display->set_trigger_level(reader.getTriggerLevel());
-        
+
+        // Update measurements
+        display->set_measurements(reader.get_measurements());
+
         TimingSnapshot snap = reader.get_stats();
         float fps_val = reader.get_fps();
         float vpp = reader.get_vpp();
@@ -1100,16 +1651,26 @@ private slots:
          .arg(snap.auto_switches);
         
         stats_label->setText(stats_text);
-        
-        auto logs = reader.get_logs();
-        QString log_text;
-        for (const auto& line : logs) {
-            log_text += QString::fromStdString(line) + "\n";
+
+        // Update debug log less frequently to reduce lag (every 5 frames = ~375ms)
+        static int log_update_counter = 0;
+        if (++log_update_counter >= 5) {
+            log_update_counter = 0;
+            auto logs = reader.get_logs();
+            QString log_text;
+            // Limit to last 100 lines for performance
+            size_t start_idx = logs.size() > 100 ? logs.size() - 100 : 0;
+            for (size_t i = start_idx; i < logs.size(); i++) {
+                log_text += QString::fromStdString(logs[i]) + "\n";
+            }
+            debug_log->setPlainText(log_text);
+            debug_log->moveCursor(QTextCursor::End);
         }
-        debug_log->setPlainText(log_text);
-        debug_log->moveCursor(QTextCursor::End);
+
+        // Update Run/Stop button state
+        update_run_stop_button();
     }
-    
+
     void change_trigger_mode(int id) {
         TriggerMode mode;
         switch(id) {
@@ -1122,34 +1683,123 @@ private slots:
         display->set_trigger_mode(mode);
     }
 
+    void toggle_run_stop() {
+        bool currently_running = reader.is_running();
+        reader.set_running(!currently_running);
+        update_run_stop_button();
+    }
+
+    void arm_single_shot() {
+        reader.arm_single_shot();
+        update_run_stop_button();
+    }
+
+    void update_run_stop_button() {
+        if (reader.is_running()) {
+            if (reader.is_single_armed()) {
+                run_stop_btn->setText("🎯 ARMED");
+                run_stop_btn->setStyleSheet(
+                    "QPushButton { background-color: #aa5500; color: white; padding: 10px; font-weight: bold; font-size: 14px; }"
+                );
+            } else {
+                run_stop_btn->setText("▶️ RUN");
+                run_stop_btn->setStyleSheet(
+                    "QPushButton { background-color: #00aa00; color: white; padding: 10px; font-weight: bold; font-size: 14px; }"
+                );
+            }
+        } else {
+            run_stop_btn->setText("⏹️ STOP");
+            run_stop_btn->setStyleSheet(
+                "QPushButton { background-color: #aa0000; color: white; padding: 10px; font-weight: bold; font-size: 14px; }"
+            );
+        }
+    }
+
+    void toggle_trigger_slope() {
+        TriggerSlope current = reader.get_trigger_slope();
+        TriggerSlope new_slope = (current == TriggerSlope::RISING) ? TriggerSlope::FALLING : TriggerSlope::RISING;
+        reader.set_trigger_slope(new_slope);
+        display->set_trigger_slope(new_slope);
+
+        if (new_slope == TriggerSlope::RISING) {
+            slope_btn->setText("↗️ RISING");
+        } else {
+            slope_btn->setText("↘️ FALLING");
+        }
+    }
+
+    void update_offset_label() {
+        float h = reader.get_h_offset();
+        float v = reader.get_v_offset();
+        QString h_str = (std::abs(h) < 1e-3f)
+            ? QString("%1µs").arg(h * 1e6f, 0, 'f', 1)
+            : QString("%1ms").arg(h * 1e3f, 0, 'f', 2);
+        offset_label->setText(QString("H: %1  V: %2V").arg(h_str).arg(v, 0, 'f', 2));
+    }
+
 protected:
     void keyPressEvent(QKeyEvent *event) override {
-        // Only process trigger level keys with debouncing
-        if (event->key() != Qt::Key_Up && event->key() != Qt::Key_Down) {
-            QWidget::keyPressEvent(event);
-            return;
-        }
-
-        // Ignore auto-repeat for trigger adjustment
+        // Ignore auto-repeat
         if (event->isAutoRepeat()) {
             return;
         }
 
-        // Debounce trigger level adjustment
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_trigger_adjust).count();
 
-        if (elapsed < TRIGGER_ADJUST_DEBOUNCE_MS) {
-            return;  // Too soon, ignore
+        bool ctrl_pressed = (event->modifiers() & Qt::ControlModifier);
+        bool shift_pressed = (event->modifiers() & Qt::ShiftModifier);
+
+        // H/V Position Offset control with Shift modifier
+        if (shift_pressed) {
+            float h = reader.get_h_offset();
+            float v = reader.get_v_offset();
+            float h_step = display->property("time_div").toFloat() * 0.1f;
+            if (h_step == 0) h_step = 0.0001f;  // Default 100µs step
+            float v_step = 0.1f;  // 100mV step
+
+            switch (event->key()) {
+                case Qt::Key_Left:
+                    reader.set_h_offset(h - h_step);
+                    display->set_h_offset(h - h_step);
+                    update_offset_label();
+                    break;
+                case Qt::Key_Right:
+                    reader.set_h_offset(h + h_step);
+                    display->set_h_offset(h + h_step);
+                    update_offset_label();
+                    break;
+                case Qt::Key_Up:
+                    reader.set_v_offset(v + v_step);
+                    display->set_v_offset(v + v_step);
+                    update_offset_label();
+                    break;
+                case Qt::Key_Down:
+                    reader.set_v_offset(v - v_step);
+                    display->set_v_offset(v - v_step);
+                    update_offset_label();
+                    break;
+            }
+            return;
         }
 
-        if (event->key() == Qt::Key_Up) {
-            reader.increaseTriggerLevel();
-            last_trigger_adjust = now;
-        } else if (event->key() == Qt::Key_Down) {
-            reader.decreaseTriggerLevel();
-            last_trigger_adjust = now;
+        // Trigger level adjustment (Up/Down without modifier)
+        if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down) {
+            if (elapsed < TRIGGER_ADJUST_DEBOUNCE_MS) {
+                return;  // Too soon, ignore
+            }
+
+            if (event->key() == Qt::Key_Up) {
+                reader.increaseTriggerLevel();
+                last_trigger_adjust = now;
+            } else if (event->key() == Qt::Key_Down) {
+                reader.decreaseTriggerLevel();
+                last_trigger_adjust = now;
+            }
+            return;
         }
+
+        QWidget::keyPressEvent(event);
     }
 };
 
