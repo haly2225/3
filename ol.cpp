@@ -1145,10 +1145,12 @@ private:
     TriggerSlope trigger_slope = TriggerSlope::RISING;
     bool dots_mode = false;  // false=lines, true=dots
 
-    // Persistence/Waveform History
-    static const int MAX_HISTORY = 16;  // Store up to 16 waveforms
+    // Segmented Memory / Waveform History (like real oscilloscope)
+    static const int MAX_HISTORY = 64;  // Store up to 64 frames
     std::deque<std::pair<std::vector<float>, std::vector<float>>> waveform_history;
     bool persistence_mode = false;
+    int playback_frame = -1;  // -1 = live view, 0..N-1 = viewing historical frame
+    bool playback_mode = false;  // True when stopped and viewing history
 
 public:
     ScopeDisplay(QWidget *parent = nullptr) : QWidget(parent) {
@@ -1159,11 +1161,15 @@ public:
         voltage = v;
         time = t;
 
-        // Store in history for persistence mode
-        if (persistence_mode && !v.empty()) {
+        // Always store frames in segmented memory (like real oscilloscope)
+        if (!v.empty()) {
             waveform_history.push_back({v, t});
             if (waveform_history.size() > MAX_HISTORY) {
                 waveform_history.pop_front();
+            }
+            // Reset playback to latest when new data arrives
+            if (playback_mode) {
+                playback_frame = waveform_history.size() - 1;
             }
         }
 
@@ -1185,13 +1191,61 @@ public:
 
     void toggle_persistence() {
         persistence_mode = !persistence_mode;
-        if (!persistence_mode) {
-            waveform_history.clear();  // Clear history when turning off
-        }
         update();
     }
     bool get_persistence() const { return persistence_mode; }
-    void clear_history() { waveform_history.clear(); update(); }
+    void clear_history() {
+        waveform_history.clear();
+        playback_frame = -1;
+        update();
+    }
+
+    // Playback mode controls (for viewing history when stopped)
+    void enter_playback() {
+        playback_mode = true;
+        if (!waveform_history.empty()) {
+            playback_frame = waveform_history.size() - 1;  // Start at latest
+        }
+        update();
+    }
+
+    void exit_playback() {
+        playback_mode = false;
+        playback_frame = -1;
+        update();
+    }
+
+    void prev_frame() {
+        if (!waveform_history.empty() && playback_frame > 0) {
+            playback_frame--;
+            update();
+        }
+    }
+
+    void next_frame() {
+        if (!waveform_history.empty() && playback_frame < (int)waveform_history.size() - 1) {
+            playback_frame++;
+            update();
+        }
+    }
+
+    void first_frame() {
+        if (!waveform_history.empty()) {
+            playback_frame = 0;
+            update();
+        }
+    }
+
+    void last_frame() {
+        if (!waveform_history.empty()) {
+            playback_frame = waveform_history.size() - 1;
+            update();
+        }
+    }
+
+    int get_frame_count() const { return waveform_history.size(); }
+    int get_current_frame() const { return playback_frame; }
+    bool is_playback_mode() const { return playback_mode; }
 
 protected:
     void paintEvent(QPaintEvent*) override {
@@ -1283,7 +1337,16 @@ protected:
         }
 
         // Waveform
-        if (!voltage.empty() && voltage.size() > 10) {
+        // Select data source: playback frame or live data
+        const std::vector<float>* display_v = &voltage;
+        const std::vector<float>* display_t = &time;
+
+        if (playback_mode && playback_frame >= 0 && playback_frame < (int)waveform_history.size()) {
+            display_v = &waveform_history[playback_frame].first;
+            display_t = &waveform_history[playback_frame].second;
+        }
+
+        if (!display_v->empty() && display_v->size() > 10) {
             // Set clipping region to prevent drawing outside grid
             p.setClipRect(margin, margin, grid_w, grid_h);
 
@@ -1339,19 +1402,19 @@ protected:
                 }
             }
 
-            // Draw current waveform (brightest)
+            // Draw current/playback waveform (brightest)
             if (dots_mode) {
                 // Dots mode - draw individual sample points
                 p.setPen(QPen(QColor(255, 220, 0), 3));
 
-                for (size_t i = 0; i < voltage.size(); i++) {
-                    float t = time[i] - h_offset;
+                for (size_t i = 0; i < display_v->size(); i++) {
+                    float t = (*display_t)[i] - h_offset;
 
                     // Skip if outside the time window
                     if (t < 0 || t > t_window) continue;
 
                     int x = margin + static_cast<int>((t / t_window) * grid_w);
-                    int y = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
+                    int y = cy - static_cast<int>(((*display_v)[i] - v_center) / v_range * grid_h);
 
                     // Safety bounds
                     x = std::max(margin, std::min(x, margin + grid_w));
@@ -1362,10 +1425,10 @@ protected:
                 // Lines mode - connect samples with lines
                 p.setPen(QPen(QColor(255, 220, 0), 2));
 
-                for (size_t i = 0; i < voltage.size() - 1; i++) {
+                for (size_t i = 0; i < display_v->size() - 1; i++) {
                     // Apply horizontal offset to time values
-                    float t1 = time[i] - h_offset;
-                    float t2 = time[i + 1] - h_offset;
+                    float t1 = (*display_t)[i] - h_offset;
+                    float t2 = (*display_t)[i + 1] - h_offset;
 
                     // Skip if both points are completely outside the time window
                     if (t2 < 0 || t1 > t_window) continue;
@@ -1376,8 +1439,8 @@ protected:
 
                     int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
                     int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
-                    int y1 = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
-                    int y2 = cy - static_cast<int>((voltage[i+1] - v_center) / v_range * grid_h);
+                    int y1 = cy - static_cast<int>(((*display_v)[i] - v_center) / v_range * grid_h);
+                    int y2 = cy - static_cast<int>(((*display_v)[i+1] - v_center) / v_range * grid_h);
 
                     // Additional safety: clamp x coordinates to grid bounds
                     x1 = std::max(margin, std::min(x1, margin + grid_w));
@@ -1395,7 +1458,22 @@ protected:
             p.setFont(QFont("Monospace", 11, QFont::Bold));
 
             int y_pos = 30;
-            p.drawText(10, y_pos, QString("N: %1").arg(voltage.size()));
+
+            // Frame counter for playback mode
+            if (playback_mode && !waveform_history.empty()) {
+                p.setPen(QColor(100, 255, 100));  // Green for playback indicator
+                p.drawText(10, y_pos, QString("PLAYBACK Frame %1/%2")
+                           .arg(playback_frame + 1)
+                           .arg(waveform_history.size()));
+                y_pos += 20;
+                p.setPen(QColor(255, 255, 100));  // Back to yellow
+            } else if (!waveform_history.empty()) {
+                // Show history count in live mode
+                p.drawText(10, y_pos, QString("History: %1 frames").arg(waveform_history.size()));
+                y_pos += 20;
+            }
+
+            p.drawText(10, y_pos, QString("N: %1").arg(display_v->size()));
             y_pos += 20;
 
             // Frequency display
@@ -1900,6 +1978,7 @@ protected:
         switch (event->key()) {
             case Qt::Key_R:
                 reader.set_running(true);
+                display->exit_playback();  // Exit playback when running
                 // Reset h_offset when resuming run
                 reader.set_h_offset(0.0f);
                 display->set_h_offset(0.0f);
@@ -1907,6 +1986,7 @@ protected:
                 return;
             case Qt::Key_S:
                 reader.set_running(false);
+                display->enter_playback();  // Enter playback mode when stopped
                 return;
             case Qt::Key_Space:
                 reader.arm_single_shot();
@@ -1918,8 +1998,22 @@ protected:
                 display->toggle_persistence();
                 return;
             case Qt::Key_C:
-                // Clear history (useful when persistence is on)
+                // Clear history
                 display->clear_history();
+                return;
+
+            // Playback frame navigation
+            case Qt::Key_PageUp:
+                display->prev_frame();
+                return;
+            case Qt::Key_PageDown:
+                display->next_frame();
+                return;
+            case Qt::Key_Home:
+                display->first_frame();
+                return;
+            case Qt::Key_End:
+                display->last_frame();
                 return;
         }
 
