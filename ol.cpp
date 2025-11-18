@@ -915,12 +915,16 @@ private:
         float trig_lvl = trigger_level.load();
         TriggerSlope slope = trigger_slope.load();
 
-        // Step 1: Find first edge in captured data with sub-sample precision
+        // Step 1: Find edge NEAR PRE_TRIGGER_SAMPLES with sub-sample precision
+        // Search in a window around the expected trigger position (not from start!)
         int first_edge_idx = -1;
         float fractional_offset = 0.0f;
 
-        // Search for edge in captured data
-        for (size_t i = 1; i < temp_size - 1; i++) {
+        // Search window: PRE_TRIGGER_SAMPLES ± 10 samples (tight window)
+        int search_start = std::max(1, PRE_TRIGGER_SAMPLES - 10);
+        int search_end = std::min((int)temp_size - 1, PRE_TRIGGER_SAMPLES + 10);
+
+        for (int i = search_start; i < search_end; i++) {
             bool edge_found = false;
 
             if (slope == TriggerSlope::RISING) {
