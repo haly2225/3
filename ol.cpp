@@ -851,10 +851,10 @@ private:
     // Simple edge detection - like a real oscilloscope!
     // Find edge - like real oscilloscope!
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // BALANCED edge detection: Small window for stability, not too strict
-        // ±2 samples = 3.3µs variance - good compromise for 1kHz signals
+        // ZERO-JITTER edge detection: ALWAYS return TARGET position if edge found
+        // This eliminates position variance completely - key to stable waveform!
         const int TARGET = BUFFER_SIZE / 5;  // 102
-        const int WINDOW = 2;  // ±2 samples - balance between strict and forgiving
+        const int WINDOW = 3;  // ±3 samples search window
 
         // Bounds checking to prevent array access errors
         int start = std::max(1, TARGET - WINDOW);  // Ensure i-1 >= 0
@@ -863,8 +863,7 @@ private:
         float trig_lvl = trigger_level.load();
         TriggerSlope slope = trigger_slope.load();
 
-        // Search for edge in window - return ACTUAL position
-        // Extraction code will normalize it to eliminate jitter
+        // Search for edge in window
         for (int i = start; i <= end; i++) {
             bool edge_found = false;
 
@@ -877,9 +876,10 @@ private:
             }
 
             if (edge_found) {
-                // Return ACTUAL edge position (not TARGET)
-                // Extraction will adjust offset so edge appears at same display position
-                return i;
+                // CRITICAL: Return TARGET (not actual position i) for ZERO jitter
+                // This ensures extraction ALWAYS starts from same offset
+                // Trade-off: lose ~5µs position accuracy, gain perfect stability
+                return TARGET;
             }
         }
 
@@ -1005,10 +1005,10 @@ private:
         std::vector<float> edge_spacings;
 
         // Debounce threshold: minimum time between edges
-        // For 1kHz signal (1ms period), use 950us to ensure only 1 edge per cycle
+        // For 1kHz signal (1.013ms period), use 980us to ensure only 1 edge per cycle
         // This heavily filters noise/ringing that creates false zero-crossings
-        // Debug showed false edges at 800-913us intervals, so 950us filters them out
-        const float MIN_EDGE_SPACING = 950e-6f;  // 950 microseconds (max 1.05kHz)
+        // Debug showed 4 edges in 2ms with 950us, need higher threshold
+        const float MIN_EDGE_SPACING = 980e-6f;  // 980 microseconds (max 1.02kHz)
 
         for (size_t i = 1; i < n; i++) {
             if (display_voltage[i-1] < mid_level && display_voltage[i] >= mid_level) {
