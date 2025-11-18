@@ -192,7 +192,6 @@ private:
     // Delayed trigger for continuous data
     int trigger_buffer_index = -1;  // Which buffer in history contains the edge
     int trigger_edge_position = -1;  // Edge position within that buffer
-    float trigger_frac_offset = 0.0f;  // Fractional sample offset for interpolation (0.0-1.0)
     int buffers_since_trigger = 0;   // Count buffers after trigger detected
 
     // Learning
@@ -766,9 +765,8 @@ private:
                         if (log_this_extraction) {
                             std::ostringstream oss;
                             oss << "🔧 EXTRACT: edge=" << trigger_edge_position
-                                << " frac=" << std::fixed << std::setprecision(3) << trigger_frac_offset
-                                << " shift=" << std::setprecision(3) << (1.0f - trigger_frac_offset)
-                                << " buf=" << start_buf_idx;
+                                << " start_buf=" << start_buf_idx
+                                << " start_pos=" << start_pos;
                             logger.log(oss.str());
                         }
 
@@ -815,23 +813,13 @@ private:
                     {
                         std::lock_guard<std::mutex> lock(data_mutex);
 
-                        // Copy to display WITH INTERPOLATION for sub-sample trigger accuracy
-                        // This eliminates horizontal jitter by aligning all waveforms to exact trigger point
-                        //
-                        // trigger_frac_offset = fraction from sample i-1 to crossing point (0.0 to 1.0)
-                        // We shift LEFT by (1 - frac) to align trigger to integer sample position
-                        float shift = 1.0f - trigger_frac_offset;
-
+                        // Copy to display - edge is ALWAYS at sample index PRE_TRIGGER_SAMPLES (100)
+                        // With tight window (±1 sample), jitter is only ±1.67µs - acceptable!
                         // Time axis: negative before trigger (t=0), positive after
-                        for (size_t i = 0; i < temp_size - 1; i++) {
-                            // Linear interpolation: output = input[i] * (1-shift) + input[i+1] * shift
-                            display_voltage[i] = temp_buffer[i] * (1.0f - shift) + temp_buffer[i + 1] * shift;
+                        for (size_t i = 0; i < temp_size; i++) {
+                            display_voltage[i] = temp_buffer[i];
                             display_time[i] = static_cast<float>((int)i - PRE_TRIGGER_SAMPLES) / SAMPLE_RATE;
                         }
-                        // Last sample: no interpolation available
-                        display_voltage[temp_size - 1] = temp_buffer[temp_size - 1];
-                        display_time[temp_size - 1] = static_cast<float>((int)(temp_size - 1) - PRE_TRIGGER_SAMPLES) / SAMPLE_RATE;
-
                         display_size = temp_size;
                         new_data = true;
                     }  // Release data_mutex lock
@@ -863,12 +851,12 @@ private:
         return false;
     }
 
-    // Simple edge detection with LINEAR INTERPOLATION - like a real oscilloscope!
-    // Returns integer sample index, stores fractional offset in trigger_frac_offset
+    // Simple edge detection - tight window for minimal jitter
+    // Returns integer sample index where edge crosses trigger level
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // Simple edge detection in first 1/5 of buffer
+        // Edge detection in first 1/5 of buffer with tight window
         const int TARGET = BUFFER_SIZE / 5;  // 102
-        const int WINDOW = 3;  // ±3 samples search window
+        const int WINDOW = 1;  // ±1 samples = ±1.67µs max jitter at 600kHz
 
         // Bounds checking to prevent array access errors
         int start = std::max(1, TARGET - WINDOW);  // Ensure i-1 >= 0
@@ -890,27 +878,10 @@ private:
             }
 
             if (edge_found) {
-                // LINEAR INTERPOLATION for sub-sample accuracy
-                // Calculate exact fractional position where signal crosses trigger level
-                float v0 = voltage[i - 1];
-                float v1 = voltage[i];
-                float delta = v1 - v0;
-
-                if (std::abs(delta) > 0.001f) {
-                    // Fraction from sample i-1 to exact crossing point
-                    trigger_frac_offset = (trig_lvl - v0) / delta;
-                } else {
-                    trigger_frac_offset = 0.0f;
-                }
-
-                // Clamp to valid range
-                trigger_frac_offset = std::max(0.0f, std::min(1.0f, trigger_frac_offset));
-
                 return i;
             }
         }
 
-        trigger_frac_offset = 0.0f;
         return -1;  // No edge in window
     }
 
