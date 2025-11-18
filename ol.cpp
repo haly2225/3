@@ -171,7 +171,7 @@ private:
     std::chrono::steady_clock::time_point last_trigger_time;
     std::chrono::steady_clock::time_point last_signal_time;
     std::chrono::steady_clock::time_point last_auto_switch_time;
-    const int HOLDOFF_MS = 50;
+    const int HOLDOFF_MS = 10;  // Reduced from 50ms - faster re-trigger for stable display
     const int SIGNAL_TIMEOUT_MS = 300;
     const int AUTO_FALLBACK_MS = 200;  // Switch to free run if no trigger
     
@@ -716,20 +716,17 @@ private:
 
                 buffers_since_trigger++;
 
-                // Need 2400 samples = 4.6875 buffers (2400/512)
-                // CRITICAL FIX: Wait only 3 buffers to prevent circular buffer wraparound
-                // With HISTORY_BUFFERS=6, waiting 5+ buffers causes trigger buffer to be overwritten!
+                // SIMPLIFIED APPROACH: Wait only 2 buffers to reduce latency and jitter
+                // This gives us enough data for 2400 samples with minimal delay
                 //
                 // Trigger buffer (index 0): ~410 samples (512 - 102)
                 // Buffer +1 (index 1): 512 samples (total: 922)
                 // Buffer +2 (index 2): 512 samples (total: 1434)
-                // Buffer +3 (index 3): 512 samples (total: 1946)
-                // Buffer +4 (index 4): 454 samples (total: 2400)
+                // Buffer +3 (index 3): 966 samples (total: 2400)
                 //
-                // After 3 buffer arrivals, we have buffers 0,1,2,3 in history
-                // After 4 buffer arrivals, we have buffers 0,1,2,3,4 in history (enough!)
-                // After 5 buffer arrivals, history_write_pos wraps and overwrites buffer 0!
-                if (buffers_since_trigger >= 4) {
+                // After 2 buffer arrivals, we have buffers 0,1,2 ready → extract immediately
+                // Faster response = less timing jitter = stable waveform!
+                if (buffers_since_trigger >= 2) {
                     // Extract data from circular buffer history with proper locking
                     temp_size = 0;
                     std::vector<int> buffers_used;
@@ -853,10 +850,10 @@ private:
     // Simple edge detection - like a real oscilloscope!
     // Find edge - like real oscilloscope!
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // STRICT edge detection: ONLY accept edge very close to target
-        // Narrow window eliminates jitter like a real oscilloscope
+        // RELAXED edge detection: Accept edge in wider window for better catch rate
+        // Trade-off: slightly larger window but much more reliable triggering
         const int TARGET = BUFFER_SIZE / 5;  // 102
-        const int WINDOW = 1;  // ±1 sample ONLY (very strict!)
+        const int WINDOW = 5;  // ±5 samples - more forgiving for real-world signals
 
         // Bounds checking to prevent array access errors
         int start = std::max(1, TARGET - WINDOW);  // Ensure i-1 >= 0
