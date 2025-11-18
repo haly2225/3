@@ -1142,6 +1142,7 @@ private:
     float h_offset = 0.0f;  // Horizontal offset
     float v_offset = 0.0f;  // Vertical offset
     TriggerSlope trigger_slope = TriggerSlope::RISING;
+    bool dots_mode = false;  // false=lines, true=dots
 
 public:
     ScopeDisplay(QWidget *parent = nullptr) : QWidget(parent) {
@@ -1162,6 +1163,10 @@ public:
     void set_h_offset(float offset) { h_offset = offset; update(); }
     void set_v_offset(float offset) { v_offset = offset; update(); }
     void set_trigger_slope(TriggerSlope slope) { trigger_slope = slope; update(); }
+    void toggle_dots_mode() { dots_mode = !dots_mode; update(); }
+    bool get_dots_mode() const { return dots_mode; }
+    float get_time_div() const { return time_div; }
+    float get_h_offset() const { return h_offset; }
 
 protected:
     void paintEvent(QPaintEvent*) override {
@@ -1257,34 +1262,55 @@ protected:
             // Set clipping region to prevent drawing outside grid
             p.setClipRect(margin, margin, grid_w, grid_h);
 
-            p.setPen(QPen(QColor(255, 220, 0), 2));
-
             float t_window = time_div * 10.0f;
             float v_center = VCC / 2.0f + v_offset;  // Apply vertical offset
             float v_range = volt_div * 8.0f;
 
-            for (size_t i = 0; i < voltage.size() - 1; i++) {
-                // Apply horizontal offset to time values
-                float t1 = time[i] - h_offset;
-                float t2 = time[i + 1] - h_offset;
+            if (dots_mode) {
+                // Dots mode - draw individual sample points
+                p.setPen(QPen(QColor(255, 220, 0), 3));
 
-                // Skip if both points are completely outside the time window
-                if (t2 < 0 || t1 > t_window) continue;
+                for (size_t i = 0; i < voltage.size(); i++) {
+                    float t = time[i] - h_offset;
 
-                // Clamp time values to window bounds to prevent drawing outside
-                float t1_clamped = std::max(0.0f, std::min(t1, t_window));
-                float t2_clamped = std::max(0.0f, std::min(t2, t_window));
+                    // Skip if outside the time window
+                    if (t < 0 || t > t_window) continue;
 
-                int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
-                int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
-                int y1 = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
-                int y2 = cy - static_cast<int>((voltage[i+1] - v_center) / v_range * grid_h);
+                    int x = margin + static_cast<int>((t / t_window) * grid_w);
+                    int y = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
 
-                // Additional safety: clamp x coordinates to grid bounds
-                x1 = std::max(margin, std::min(x1, margin + grid_w));
-                x2 = std::max(margin, std::min(x2, margin + grid_w));
+                    // Safety bounds
+                    x = std::max(margin, std::min(x, margin + grid_w));
 
-                p.drawLine(x1, y1, x2, y2);
+                    p.drawPoint(x, y);
+                }
+            } else {
+                // Lines mode - connect samples with lines
+                p.setPen(QPen(QColor(255, 220, 0), 2));
+
+                for (size_t i = 0; i < voltage.size() - 1; i++) {
+                    // Apply horizontal offset to time values
+                    float t1 = time[i] - h_offset;
+                    float t2 = time[i + 1] - h_offset;
+
+                    // Skip if both points are completely outside the time window
+                    if (t2 < 0 || t1 > t_window) continue;
+
+                    // Clamp time values to window bounds to prevent drawing outside
+                    float t1_clamped = std::max(0.0f, std::min(t1, t_window));
+                    float t2_clamped = std::max(0.0f, std::min(t2, t_window));
+
+                    int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
+                    int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
+                    int y1 = cy - static_cast<int>((voltage[i] - v_center) / v_range * grid_h);
+                    int y2 = cy - static_cast<int>((voltage[i+1] - v_center) / v_range * grid_h);
+
+                    // Additional safety: clamp x coordinates to grid bounds
+                    x1 = std::max(margin, std::min(x1, margin + grid_w));
+                    x2 = std::max(margin, std::min(x2, margin + grid_w));
+
+                    p.drawLine(x1, y1, x2, y2);
+                }
             }
 
             // Reset clipping for subsequent drawing
@@ -1749,9 +1775,9 @@ protected:
 
         // H/V Position Offset control with Shift modifier
         if (shift_pressed) {
-            float h = reader.get_h_offset();
+            float h = display->get_h_offset();
             float v = reader.get_v_offset();
-            float h_step = display->property("time_div").toFloat() * 0.1f;
+            float h_step = display->get_time_div() * 0.1f;
             if (h_step == 0) h_step = 0.0001f;  // Default 100µs step
             float v_step = 0.1f;  // 100mV step
 
@@ -1796,10 +1822,14 @@ protected:
             return;
         }
 
-        // Acquisition control: R=RUN, S=STOP, Space=SINGLE
+        // Acquisition control: R=RUN, S=STOP, Space=SINGLE, D=dots mode
         switch (event->key()) {
             case Qt::Key_R:
                 reader.set_running(true);
+                // Reset h_offset when resuming run
+                reader.set_h_offset(0.0f);
+                display->set_h_offset(0.0f);
+                update_offset_label();
                 return;
             case Qt::Key_S:
                 reader.set_running(false);
@@ -1807,6 +1837,27 @@ protected:
             case Qt::Key_Space:
                 reader.arm_single_shot();
                 return;
+            case Qt::Key_D:
+                display->toggle_dots_mode();
+                return;
+        }
+
+        // Horizontal scroll with Left/Right when STOPPED (no modifier)
+        if (!reader.is_running() && (event->key() == Qt::Key_Left || event->key() == Qt::Key_Right)) {
+            float h = display->get_h_offset();
+            // Scroll 1 time division per key press (10% of display)
+            float h_step = display->get_time_div();
+            if (h_step == 0) h_step = 0.001f;  // Default 1ms step
+
+            if (event->key() == Qt::Key_Left) {
+                reader.set_h_offset(h - h_step);
+                display->set_h_offset(h - h_step);
+            } else {
+                reader.set_h_offset(h + h_step);
+                display->set_h_offset(h + h_step);
+            }
+            update_offset_label();
+            return;
         }
 
         QWidget::keyPressEvent(event);
