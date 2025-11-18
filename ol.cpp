@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <vector>
 #include <array>
+#include <deque>
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -1144,6 +1145,11 @@ private:
     TriggerSlope trigger_slope = TriggerSlope::RISING;
     bool dots_mode = false;  // false=lines, true=dots
 
+    // Persistence/Waveform History
+    static const int MAX_HISTORY = 16;  // Store up to 16 waveforms
+    std::deque<std::pair<std::vector<float>, std::vector<float>>> waveform_history;
+    bool persistence_mode = false;
+
 public:
     ScopeDisplay(QWidget *parent = nullptr) : QWidget(parent) {
         setMinimumSize(800, 600);
@@ -1152,6 +1158,15 @@ public:
     void update_waveform(const std::vector<float>& v, const std::vector<float>& t) {
         voltage = v;
         time = t;
+
+        // Store in history for persistence mode
+        if (persistence_mode && !v.empty()) {
+            waveform_history.push_back({v, t});
+            if (waveform_history.size() > MAX_HISTORY) {
+                waveform_history.pop_front();
+            }
+        }
+
         update();
     }
 
@@ -1167,6 +1182,16 @@ public:
     bool get_dots_mode() const { return dots_mode; }
     float get_time_div() const { return time_div; }
     float get_h_offset() const { return h_offset; }
+
+    void toggle_persistence() {
+        persistence_mode = !persistence_mode;
+        if (!persistence_mode) {
+            waveform_history.clear();  // Clear history when turning off
+        }
+        update();
+    }
+    bool get_persistence() const { return persistence_mode; }
+    void clear_history() { waveform_history.clear(); update(); }
 
 protected:
     void paintEvent(QPaintEvent*) override {
@@ -1266,6 +1291,55 @@ protected:
             float v_center = VCC / 2.0f + v_offset;  // Apply vertical offset
             float v_range = volt_div * 8.0f;
 
+            // Draw persistence/history waveforms (older = more faded)
+            if (persistence_mode && !waveform_history.empty()) {
+                int history_size = waveform_history.size();
+                for (int h = 0; h < history_size; h++) {
+                    const auto& hist = waveform_history[h];
+                    const auto& hist_v = hist.first;
+                    const auto& hist_t = hist.second;
+
+                    if (hist_v.empty()) continue;
+
+                    // Alpha fades from 30 (oldest) to 150 (newest in history)
+                    int alpha = 30 + (h * 120) / std::max(1, history_size - 1);
+                    QColor hist_color(255, 220, 0, alpha);
+
+                    if (dots_mode) {
+                        p.setPen(QPen(hist_color, 2));
+                        for (size_t i = 0; i < hist_v.size(); i++) {
+                            float t = hist_t[i] - h_offset;
+                            if (t < 0 || t > t_window) continue;
+
+                            int x = margin + static_cast<int>((t / t_window) * grid_w);
+                            int y = cy - static_cast<int>((hist_v[i] - v_center) / v_range * grid_h);
+                            x = std::max(margin, std::min(x, margin + grid_w));
+                            p.drawPoint(x, y);
+                        }
+                    } else {
+                        p.setPen(QPen(hist_color, 1));
+                        for (size_t i = 0; i < hist_v.size() - 1; i++) {
+                            float t1 = hist_t[i] - h_offset;
+                            float t2 = hist_t[i + 1] - h_offset;
+                            if (t2 < 0 || t1 > t_window) continue;
+
+                            float t1_c = std::max(0.0f, std::min(t1, t_window));
+                            float t2_c = std::max(0.0f, std::min(t2, t_window));
+
+                            int x1 = margin + static_cast<int>((t1_c / t_window) * grid_w);
+                            int x2 = margin + static_cast<int>((t2_c / t_window) * grid_w);
+                            int y1 = cy - static_cast<int>((hist_v[i] - v_center) / v_range * grid_h);
+                            int y2 = cy - static_cast<int>((hist_v[i+1] - v_center) / v_range * grid_h);
+
+                            x1 = std::max(margin, std::min(x1, margin + grid_w));
+                            x2 = std::max(margin, std::min(x2, margin + grid_w));
+                            p.drawLine(x1, y1, x2, y2);
+                        }
+                    }
+                }
+            }
+
+            // Draw current waveform (brightest)
             if (dots_mode) {
                 // Dots mode - draw individual sample points
                 p.setPen(QPen(QColor(255, 220, 0), 3));
@@ -1822,7 +1896,7 @@ protected:
             return;
         }
 
-        // Acquisition control: R=RUN, S=STOP, Space=SINGLE, D=dots mode
+        // Acquisition control: R=RUN, S=STOP, Space=SINGLE, D=dots, P=persistence
         switch (event->key()) {
             case Qt::Key_R:
                 reader.set_running(true);
@@ -1839,6 +1913,13 @@ protected:
                 return;
             case Qt::Key_D:
                 display->toggle_dots_mode();
+                return;
+            case Qt::Key_P:
+                display->toggle_persistence();
+                return;
+            case Qt::Key_C:
+                // Clear history (useful when persistence is on)
+                display->clear_history();
                 return;
         }
 
