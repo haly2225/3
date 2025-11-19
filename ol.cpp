@@ -48,7 +48,7 @@ constexpr uint16_t PACKET_SIZE = 4 + BUFFER_SIZE * 2;
 constexpr float    SAMPLE_RATE = 411000.0f;  // Actual rate from timing analysis
 constexpr float    VCC = 3.3f;
 constexpr uint16_t ADC_MAX = 4095;
-constexpr size_t   CAPTURE_SIZE = 1000;  // Reduced to minimize dependency on history splicing
+constexpr size_t   CAPTURE_SIZE = 512;   // Snapshot mode: exactly 1 packet for stable display
 
 // Trigger modes
 enum class TriggerMode {
@@ -519,18 +519,20 @@ private:
         uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
 
-        // --- ANTI-DRIFT MECHANISM: Detect packet gaps ---
+        // --- ANTI-DRIFT DISABLED for Snapshot mode ---
+        // Allow buffer to fill even with packet gaps
+        /*
         static uint16_t last_frame_num = 0;
         bool gap_detected = false;
 
         if (frame_initialized) {
-            // Check if this packet is consecutive
             uint16_t expected = static_cast<uint16_t>(last_frame_num + 1);
             if (frame_num != expected) {
-                gap_detected = true;  // Gap detected!
+                gap_detected = true;
             }
         }
         last_frame_num = frame_num;
+        */
 
         if (!frame_initialized) {
             frame_initialized = true;
@@ -556,13 +558,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(buffer_history_mutex);
 
-            if (gap_detected) {
-                // PACKET GAP: Reset buffer immediately!
-                // Better to skip this frame than to display phase-shifted waveform
-                buffers_in_history = 0;
-                history_write_pos = 0;
-                // Still load current packet as new start point
-            }
+            // Gap detection disabled for Snapshot mode
+            // Allow buffer to fill for trigger to work
 
             buffer_history[history_write_pos] = voltage;
             history_write_pos = (history_write_pos + 1) % HISTORY_BUFFERS;
@@ -726,7 +723,8 @@ private:
 
             case State::IDLE: {
                 // Find rising edge and trigger
-                if (vpp > TRIGGER_THRESHOLD && buffers_in_history >= HISTORY_BUFFERS) {
+                // Only need 1 buffer for Snapshot mode (512 samples)
+                if (vpp > TRIGGER_THRESHOLD && buffers_in_history >= 1) {
                     int edge_idx = find_simple_edge(voltage);
 
                     if (edge_idx >= 0) {
@@ -1159,8 +1157,8 @@ private:
         std::vector<float> edge_spacings;
 
         // Debounce threshold: minimum time between edges
-        // Use 400us to filter out ringing/noise on 1kHz signal (period 1000us)
-        const float MIN_EDGE_SPACING = 400e-6f;  // 400 microseconds (max 2.5kHz)
+        // Use 800us to filter all noise and harmonics, only count 1kHz main signal
+        const float MIN_EDGE_SPACING = 800e-6f;  // 800 microseconds (max 1.25kHz)
 
         for (size_t i = 1; i < n; i++) {
             if (display_voltage[i-1] < mid_level && display_voltage[i] >= mid_level) {
