@@ -894,13 +894,9 @@ private:
     // Hysteresis edge detection - stable trigger like Tektronix/Keysight
     // Returns integer sample index where edge crosses trigger level with hysteresis
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // Edge detection in first 1/5 of buffer with tight window
-        const int TARGET = BUFFER_SIZE / 5;  // 102
-        const int WINDOW = 3;  // ±3 samples for hysteresis search
-
-        // Bounds checking to prevent array access errors
-        int start = std::max(1, TARGET - WINDOW);  // Ensure i-1 >= 0
-        int end = std::min((int)BUFFER_SIZE - 1, TARGET + WINDOW);
+        // Search in first 60% of buffer to reliably find rising edge
+        int start = 5;
+        int end = BUFFER_SIZE * 0.6;
 
         float trig_lvl = trigger_level.load();
         TriggerSlope slope = trigger_slope.load();
@@ -911,25 +907,11 @@ private:
         float low_level = trig_lvl - HYSTERESIS;
 
         // State machine: track if signal was below low level
-        bool below_low = false;
-        bool above_high = false;
+        bool below_low = (voltage[start] < low_level);
+        bool above_high = (voltage[start] > high_level);
 
-        // Pre-scan to find initial state
-        for (int i = start - 1; i >= 0 && i >= start - 10; i--) {
-            if (voltage[i] < low_level) {
-                below_low = true;
-                break;
-            }
-            if (voltage[i] > high_level) {
-                above_high = true;
-                break;
-            }
-        }
-
-        // Search for edge in window with hysteresis
-        for (int i = start; i <= end; i++) {
-            bool edge_found = false;
-
+        // Search for edge in wider range with hysteresis
+        for (int i = start; i < end; i++) {
             if (slope == TriggerSlope::RISING) {
                 // Track state
                 if (voltage[i] < low_level) {
@@ -938,7 +920,7 @@ private:
                 }
                 // Rising edge: was below LOW, now above HIGH
                 if (below_low && voltage[i] > high_level) {
-                    edge_found = true;
+                    return i;  // Found trigger!
                 }
             } else {
                 // Falling edge with hysteresis
@@ -949,16 +931,12 @@ private:
                 }
                 // Falling edge: was above HIGH, now below LOW
                 if (above_high && voltage[i] < low_level) {
-                    edge_found = true;
+                    return i;  // Found trigger!
                 }
-            }
-
-            if (edge_found) {
-                return i;
             }
         }
 
-        return -1;  // No edge in window
+        return -1;  // No edge found
     }
 
     // Phase-Locked Multi-Cycle Alignment - professional oscilloscope technique
@@ -1175,10 +1153,8 @@ private:
         std::vector<float> edge_spacings;
 
         // Debounce threshold: minimum time between edges
-        // For 1kHz signal (1.000ms period), use 995us to ensure only 1 edge per cycle
-        // This heavily filters noise/ringing that creates false zero-crossings
-        // Debug showed false edges at 1.053ms with 980us, need 995us minimum
-        const float MIN_EDGE_SPACING = 995e-6f;  // 995 microseconds (max 1.005kHz)
+        // Use 100us to support signals up to 10kHz while filtering noise
+        const float MIN_EDGE_SPACING = 100e-6f;  // 100 microseconds (max 10kHz)
 
         for (size_t i = 1; i < n; i++) {
             if (display_voltage[i-1] < mid_level && display_voltage[i] >= mid_level) {
@@ -1314,7 +1290,7 @@ private:
     float v_offset = 0.0f;  // Vertical offset
     TriggerSlope trigger_slope = TriggerSlope::RISING;
     bool dots_mode = false;  // false=lines, true=dots
-    bool smoothing_enabled = true;  // Smooth waveform for professional look
+    bool smoothing_enabled = false;  // Disabled by default for sharp square waves
     bool glow_enabled = true;  // Glow effect for CRT-like appearance
 
     // Segmented Memory / Waveform History (like real oscilloscope)
