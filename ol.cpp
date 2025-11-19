@@ -48,7 +48,7 @@ constexpr uint16_t PACKET_SIZE = 4 + BUFFER_SIZE * 2;
 constexpr float    SAMPLE_RATE = 411000.0f;  // Actual rate from timing analysis
 constexpr float    VCC = 3.3f;
 constexpr uint16_t ADC_MAX = 4095;
-constexpr size_t   CAPTURE_SIZE = 2400;  // ~4ms @ 600kHz - always collect same number of samples after edge
+constexpr size_t   CAPTURE_SIZE = 1000;  // Reduced to minimize dependency on history splicing
 
 // Trigger modes
 enum class TriggerMode {
@@ -519,24 +519,18 @@ private:
         uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
 
-        // Frame continuity check DISABLED - accept packet loss to prioritize display
-        // (Packet loss causes history reset which makes waveform unstable)
-        /*
+        // --- ANTI-DRIFT MECHANISM: Detect packet gaps ---
         static uint16_t last_frame_num = 0;
+        bool gap_detected = false;
+
         if (frame_initialized) {
-            // Check if frame is consecutive (with 16-bit wraparound)
+            // Check if this packet is consecutive
             uint16_t expected = static_cast<uint16_t>(last_frame_num + 1);
             if (frame_num != expected) {
-                // Dropped packet detected! Reset history to avoid incorrect waveform splicing
-                std::lock_guard<std::mutex> lock(buffer_history_mutex);
-                buffers_in_history = 0;
-                history_write_pos = 0;
-                state = State::IDLE;
-                // logger.log("⚠️ Drop detected, reset history");  // Uncomment for debug
+                gap_detected = true;  // Gap detected!
             }
         }
         last_frame_num = frame_num;
-        */
 
         if (!frame_initialized) {
             frame_initialized = true;
@@ -561,6 +555,15 @@ private:
         // Store in circular buffer history for continuous data
         {
             std::lock_guard<std::mutex> lock(buffer_history_mutex);
+
+            if (gap_detected) {
+                // PACKET GAP: Reset buffer immediately!
+                // Better to skip this frame than to display phase-shifted waveform
+                buffers_in_history = 0;
+                history_write_pos = 0;
+                // Still load current packet as new start point
+            }
+
             buffer_history[history_write_pos] = voltage;
             history_write_pos = (history_write_pos + 1) % HISTORY_BUFFERS;
             if (buffers_in_history < HISTORY_BUFFERS) {
@@ -577,9 +580,9 @@ private:
         float vpp = vmax - vmin;
         last_vpp = vpp;
 
-        // DEBUG: Log signal measurements every 100 frames
+        // DEBUG: Log signal measurements every 500 frames (reduced to minimize CPU load)
         static int debug_counter = 0;
-        if (debug_counter++ % 100 == 0) {
+        if (debug_counter++ % 500 == 0) {
             std::ostringstream oss;
             oss << "📊 Vpp=" << std::fixed << std::setprecision(2) << vpp
                 << "V, Max=" << vmax << "V, Min=" << vmin << "V, Frame=" << frame_num;
@@ -1156,8 +1159,8 @@ private:
         std::vector<float> edge_spacings;
 
         // Debounce threshold: minimum time between edges
-        // Use 100us to support signals up to 10kHz while filtering noise
-        const float MIN_EDGE_SPACING = 100e-6f;  // 100 microseconds (max 10kHz)
+        // Use 400us to filter out ringing/noise on 1kHz signal (period 1000us)
+        const float MIN_EDGE_SPACING = 400e-6f;  // 400 microseconds (max 2.5kHz)
 
         for (size_t i = 1; i < n; i++) {
             if (display_voltage[i-1] < mid_level && display_voltage[i] >= mid_level) {
@@ -1188,9 +1191,9 @@ private:
             period = (last_edge_time - first_edge_time) / (rising_edges - 1);
             frequency = 1.0f / period;
 
-            // DEBUG: Log frequency measurement details
+            // DEBUG: Log frequency measurement details (reduced to minimize CPU load)
             static int freq_log_count = 0;
-            if (++freq_log_count % 10 == 1) {
+            if (++freq_log_count % 100 == 1) {
                 std::ostringstream oss;
                 oss << "📊 FREQ: edges=" << rising_edges
                     << " period=" << std::fixed << std::setprecision(6) << period
