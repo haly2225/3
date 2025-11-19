@@ -519,7 +519,9 @@ private:
         uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
 
-        // Frame continuity check - detect dropped packets
+        // Frame continuity check DISABLED - accept packet loss to prioritize display
+        // (Packet loss causes history reset which makes waveform unstable)
+        /*
         static uint16_t last_frame_num = 0;
         if (frame_initialized) {
             // Check if frame is consecutive (with 16-bit wraparound)
@@ -534,6 +536,7 @@ private:
             }
         }
         last_frame_num = frame_num;
+        */
 
         if (!frame_initialized) {
             frame_initialized = true;
@@ -894,9 +897,9 @@ private:
     // Hysteresis edge detection - stable trigger like Tektronix/Keysight
     // Returns integer sample index where edge crosses trigger level with hysteresis
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
-        // Search in first 60% of buffer to reliably find rising edge
+        // Search nearly entire buffer to reliably find rising edge
         int start = 5;
-        int end = BUFFER_SIZE * 0.6;
+        int end = BUFFER_SIZE - 20;  // Leave small margin at end
 
         float trig_lvl = trigger_level.load();
         TriggerSlope slope = trigger_slope.load();
