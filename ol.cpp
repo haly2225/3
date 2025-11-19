@@ -875,12 +875,12 @@ private:
         return false;
     }
 
-    // Simple edge detection - tight window for minimal jitter
-    // Returns integer sample index where edge crosses trigger level
+    // Hysteresis edge detection - stable trigger like Tektronix/Keysight
+    // Returns integer sample index where edge crosses trigger level with hysteresis
     int find_simple_edge(const std::array<float, BUFFER_SIZE>& voltage) {
         // Edge detection in first 1/5 of buffer with tight window
         const int TARGET = BUFFER_SIZE / 5;  // 102
-        const int WINDOW = 1;  // ±1 samples = ±1.67µs max jitter at 600kHz
+        const int WINDOW = 3;  // ±3 samples for hysteresis search
 
         // Bounds checking to prevent array access errors
         int start = std::max(1, TARGET - WINDOW);  // Ensure i-1 >= 0
@@ -889,16 +889,52 @@ private:
         float trig_lvl = trigger_level.load();
         TriggerSlope slope = trigger_slope.load();
 
-        // Search for edge in window
+        // Hysteresis parameters (prevent jitter from noise)
+        const float HYSTERESIS = 0.05f;  // 50mV hysteresis band
+        float high_level = trig_lvl + HYSTERESIS;
+        float low_level = trig_lvl - HYSTERESIS;
+
+        // State machine: track if signal was below low level
+        bool below_low = false;
+        bool above_high = false;
+
+        // Pre-scan to find initial state
+        for (int i = start - 1; i >= 0 && i >= start - 10; i--) {
+            if (voltage[i] < low_level) {
+                below_low = true;
+                break;
+            }
+            if (voltage[i] > high_level) {
+                above_high = true;
+                break;
+            }
+        }
+
+        // Search for edge in window with hysteresis
         for (int i = start; i <= end; i++) {
             bool edge_found = false;
 
             if (slope == TriggerSlope::RISING) {
-                // Rising edge: voltage crosses trigger level upward
-                edge_found = (voltage[i - 1] < trig_lvl && voltage[i] >= trig_lvl);
+                // Track state
+                if (voltage[i] < low_level) {
+                    below_low = true;
+                    above_high = false;
+                }
+                // Rising edge: was below LOW, now above HIGH
+                if (below_low && voltage[i] > high_level) {
+                    edge_found = true;
+                }
             } else {
-                // Falling edge: voltage crosses trigger level downward
-                edge_found = (voltage[i - 1] > trig_lvl && voltage[i] <= trig_lvl);
+                // Falling edge with hysteresis
+                // Track state
+                if (voltage[i] > high_level) {
+                    above_high = true;
+                    below_low = false;
+                }
+                // Falling edge: was above HIGH, now below LOW
+                if (above_high && voltage[i] < low_level) {
+                    edge_found = true;
+                }
             }
 
             if (edge_found) {
@@ -1262,6 +1298,8 @@ private:
     float v_offset = 0.0f;  // Vertical offset
     TriggerSlope trigger_slope = TriggerSlope::RISING;
     bool dots_mode = false;  // false=lines, true=dots
+    bool smoothing_enabled = true;  // Smooth waveform for professional look
+    bool glow_enabled = true;  // Glow effect for CRT-like appearance
 
     // Segmented Memory / Waveform History (like real oscilloscope)
     static const int MAX_HISTORY = 64;  // Store up to 64 frames
@@ -1269,6 +1307,27 @@ private:
     bool persistence_mode = false;
     int playback_frame = -1;  // -1 = live view, 0..N-1 = viewing historical frame
     bool playback_mode = false;  // True when stopped and viewing history
+
+    // Smoothing helper function (weighted moving average)
+    float smooth_value(const std::vector<float>& data, size_t idx) {
+        if (idx <= 0 || idx >= data.size() - 1) return data[idx];
+        // Weighted average: (prev + 2*current + next) / 4
+        return (data[idx - 1] + 2.0f * data[idx] + data[idx + 1]) / 4.0f;
+    }
+
+    // Apply smoothing to entire waveform
+    std::vector<float> apply_smoothing(const std::vector<float>& data) {
+        if (!smoothing_enabled || data.size() < 3) return data;
+
+        std::vector<float> smoothed(data.size());
+        smoothed[0] = data[0];
+        smoothed[data.size() - 1] = data[data.size() - 1];
+
+        for (size_t i = 1; i < data.size() - 1; i++) {
+            smoothed[i] = smooth_value(data, i);
+        }
+        return smoothed;
+    }
 
 public:
     ScopeDisplay(QWidget *parent = nullptr) : QWidget(parent) {
@@ -1317,6 +1376,20 @@ public:
         playback_frame = -1;
         update();
     }
+
+    // Smoothing toggle
+    void toggle_smoothing() {
+        smoothing_enabled = !smoothing_enabled;
+        update();
+    }
+    bool get_smoothing() const { return smoothing_enabled; }
+
+    // Glow effect toggle
+    void toggle_glow() {
+        glow_enabled = !glow_enabled;
+        update();
+    }
+    bool get_glow() const { return glow_enabled; }
 
     // Playback mode controls (for viewing history when stopped)
     void enter_playback() {
@@ -1368,15 +1441,15 @@ public:
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
-        // Disable antialiasing for performance (reduce lag)
-        // p.setRenderHint(QPainter::Antialiasing);
-        
+        // Enable antialiasing for smooth professional waveforms
+        p.setRenderHint(QPainter::Antialiasing);
+
         int w = width();
         int h = height();
         int margin = 50;
         int grid_w = w - 2 * margin;
         int grid_h = h - 2 * margin;
-        
+
         p.fillRect(0, 0, w, h, QColor(15, 15, 15));
         
         // Grid
@@ -1520,19 +1593,23 @@ protected:
                 }
             }
 
+            // Apply smoothing filter for professional look
+            std::vector<float> smoothed_v = apply_smoothing(*display_v);
+            const std::vector<float>* final_v = &smoothed_v;
+
             // Draw current/playback waveform (brightest)
             if (dots_mode) {
                 // Dots mode - draw individual sample points
                 p.setPen(QPen(QColor(255, 220, 0), 3));
 
-                for (size_t i = 0; i < display_v->size(); i++) {
+                for (size_t i = 0; i < final_v->size(); i++) {
                     float t = (*display_t)[i] - h_offset;
 
                     // Skip if outside the time window
                     if (t < 0 || t > t_window) continue;
 
                     int x = margin + static_cast<int>((t / t_window) * grid_w);
-                    int y = cy - static_cast<int>(((*display_v)[i] - v_center) / v_range * grid_h);
+                    int y = cy - static_cast<int>(((*final_v)[i] - v_center) / v_range * grid_h);
 
                     // Safety bounds
                     x = std::max(margin, std::min(x, margin + grid_w));
@@ -1541,9 +1618,36 @@ protected:
                 }
             } else {
                 // Lines mode - connect samples with lines
+
+                // GLOW EFFECT: Draw thick semi-transparent line first (CRT phosphor glow)
+                if (glow_enabled) {
+                    p.setPen(QPen(QColor(255, 220, 0, 60), 6));  // Wide, semi-transparent
+
+                    for (size_t i = 0; i < final_v->size() - 1; i++) {
+                        float t1 = (*display_t)[i] - h_offset;
+                        float t2 = (*display_t)[i + 1] - h_offset;
+
+                        if (t2 < 0 || t1 > t_window) continue;
+
+                        float t1_clamped = std::max(0.0f, std::min(t1, t_window));
+                        float t2_clamped = std::max(0.0f, std::min(t2, t_window));
+
+                        int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
+                        int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
+                        int y1 = cy - static_cast<int>(((*final_v)[i] - v_center) / v_range * grid_h);
+                        int y2 = cy - static_cast<int>(((*final_v)[i+1] - v_center) / v_range * grid_h);
+
+                        x1 = std::max(margin, std::min(x1, margin + grid_w));
+                        x2 = std::max(margin, std::min(x2, margin + grid_w));
+
+                        p.drawLine(x1, y1, x2, y2);
+                    }
+                }
+
+                // MAIN WAVEFORM: Draw bright thin line on top
                 p.setPen(QPen(QColor(255, 220, 0), 2));
 
-                for (size_t i = 0; i < display_v->size() - 1; i++) {
+                for (size_t i = 0; i < final_v->size() - 1; i++) {
                     // Apply horizontal offset to time values
                     float t1 = (*display_t)[i] - h_offset;
                     float t2 = (*display_t)[i + 1] - h_offset;
@@ -1557,8 +1661,8 @@ protected:
 
                     int x1 = margin + static_cast<int>((t1_clamped / t_window) * grid_w);
                     int x2 = margin + static_cast<int>((t2_clamped / t_window) * grid_w);
-                    int y1 = cy - static_cast<int>(((*display_v)[i] - v_center) / v_range * grid_h);
-                    int y2 = cy - static_cast<int>(((*display_v)[i+1] - v_center) / v_range * grid_h);
+                    int y1 = cy - static_cast<int>(((*final_v)[i] - v_center) / v_range * grid_h);
+                    int y2 = cy - static_cast<int>(((*final_v)[i+1] - v_center) / v_range * grid_h);
 
                     // Additional safety: clamp x coordinates to grid bounds
                     x1 = std::max(margin, std::min(x1, margin + grid_w));
@@ -2136,6 +2240,14 @@ protected:
             case Qt::Key_L:
                 // Toggle phase-lock
                 reader.set_phase_lock(!reader.get_phase_lock());
+                return;
+            case Qt::Key_M:
+                // Toggle smoothing filter
+                display->toggle_smoothing();
+                return;
+            case Qt::Key_G:
+                // Toggle glow effect
+                display->toggle_glow();
                 return;
 
             // Playback frame navigation
