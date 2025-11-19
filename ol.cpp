@@ -45,7 +45,7 @@ constexpr uint8_t  MARKER_START = 0xAA;
 constexpr uint8_t  MARKER_HEADER = 0x55;
 constexpr uint16_t BUFFER_SIZE = 512;
 constexpr uint16_t PACKET_SIZE = 4 + BUFFER_SIZE * 2;
-constexpr float    SAMPLE_RATE = 600000.0f;
+constexpr float    SAMPLE_RATE = 411000.0f;  // Actual rate from timing analysis
 constexpr float    VCC = 3.3f;
 constexpr uint16_t ADC_MAX = 4095;
 constexpr size_t   CAPTURE_SIZE = 2400;  // ~4ms @ 600kHz - always collect same number of samples after edge
@@ -464,8 +464,8 @@ private:
                 usleep(1000);
                 continue;
             }
-            
-            usleep(600);
+
+            // Removed usleep(600) - SPI 16MHz needs full speed to keep up with STM32
             stats.total_packets++;
             
             auto now = std::chrono::steady_clock::now();
@@ -518,6 +518,22 @@ private:
 
         uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
+
+        // Frame continuity check - detect dropped packets
+        static uint16_t last_frame_num = 0;
+        if (frame_initialized) {
+            // Check if frame is consecutive (with 16-bit wraparound)
+            uint16_t expected = static_cast<uint16_t>(last_frame_num + 1);
+            if (frame_num != expected) {
+                // Dropped packet detected! Reset history to avoid incorrect waveform splicing
+                std::lock_guard<std::mutex> lock(buffer_history_mutex);
+                buffers_in_history = 0;
+                history_write_pos = 0;
+                state = State::IDLE;
+                // logger.log("⚠️ Drop detected, reset history");  // Uncomment for debug
+            }
+        }
+        last_frame_num = frame_num;
 
         if (!frame_initialized) {
             frame_initialized = true;
