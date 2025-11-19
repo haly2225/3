@@ -447,8 +447,8 @@ private:
         
         std::vector<uint8_t> rx_buf(PACKET_SIZE);
         std::vector<uint8_t> tx_buf(PACKET_SIZE, 0x00);
-        
-        logger.log("🔁 Loop start");
+
+        // logger.log("🔁 Loop start");  // Disabled for performance
         last_signal_time = std::chrono::steady_clock::now();
         last_auto_switch_time = last_signal_time;
         
@@ -500,8 +500,8 @@ private:
                 last_fps_time = now;
             }
         }
-        
-        logger.log("🔁 Exit");
+
+        // logger.log("🔁 Exit");  // Disabled for performance
     }
     
     bool parse_packet(const std::vector<uint8_t>& buf) {
@@ -577,14 +577,14 @@ private:
         float vpp = vmax - vmin;
         last_vpp = vpp;
 
-        // DEBUG: Log signal measurements every 500 frames (reduced to minimize CPU load)
-        static int debug_counter = 0;
-        if (debug_counter++ % 500 == 0) {
-            std::ostringstream oss;
-            oss << "📊 Vpp=" << std::fixed << std::setprecision(2) << vpp
-                << "V, Max=" << vmax << "V, Min=" << vmin << "V, Frame=" << frame_num;
-            logger.log(oss.str());
-        }
+        // DEBUG logging disabled for performance
+        // static int debug_counter = 0;
+        // if (debug_counter++ % 500 == 0) {
+        //     std::ostringstream oss;
+        //     oss << "📊 Vpp=" << std::fixed << std::setprecision(2) << vpp
+        //         << "V, Max=" << vmax << "V, Min=" << vmin << "V, Frame=" << frame_num;
+        //     logger.log(oss.str());
+        // }
         
         // Signal detection
         if (vpp > 0.5f) {
@@ -730,14 +730,14 @@ private:
                     if (edge_idx >= 0) {
                         stats.trigger_count++;
 
-                        // Log only every 20 triggers to reduce spam
-                        static int trigger_log_count = 0;
-                        if (++trigger_log_count % 20 == 1) {
-                            std::ostringstream oss;
-                            oss << "🎯 TRIGGER! edge=" << edge_idx
-                                << ", vpp=" << std::fixed << std::setprecision(2) << vpp << "V";
-                            logger.log(oss.str());
-                        }
+                        // TRIGGER logging disabled for performance
+                        // static int trigger_log_count = 0;
+                        // if (++trigger_log_count % 20 == 1) {
+                        //     std::ostringstream oss;
+                        //     oss << "🎯 TRIGGER! edge=" << edge_idx
+                        //         << ", vpp=" << std::fixed << std::setprecision(2) << vpp << "V";
+                        //     logger.log(oss.str());
+                        // }
 
                         // DELAYED TRIGGER: Save trigger info and wait for more buffers
                         // This allows us to collect full 1200 samples from history
@@ -803,17 +803,17 @@ private:
                             start_pos = BUFFER_SIZE - (PRE_TRIGGER_SAMPLES - trigger_edge_position);
                         }
 
-                        // DEBUG: Track extraction details
-                        static int extract_log_count = 0;
-                        log_this_extraction = (++extract_log_count % 10 == 1);
-
-                        if (log_this_extraction) {
-                            std::ostringstream oss;
-                            oss << "🔧 EXTRACT: edge=" << trigger_edge_position
-                                << " start_buf=" << start_buf_idx
-                                << " start_pos=" << start_pos;
-                            logger.log(oss.str());
-                        }
+                        // DEBUG logging disabled for performance
+                        // static int extract_log_count = 0;
+                        // log_this_extraction = (++extract_log_count % 10 == 1);
+                        // if (log_this_extraction) {
+                        //     std::ostringstream oss;
+                        //     oss << "🔧 EXTRACT: edge=" << trigger_edge_position
+                        //         << " start_buf=" << start_buf_idx
+                        //         << " start_pos=" << start_pos;
+                        //     logger.log(oss.str());
+                        // }
+                        bool log_this_extraction = false;
 
                         // Extract samples starting from calculated position
                         int buf_idx = start_buf_idx;
@@ -1189,29 +1189,27 @@ private:
             period = (last_edge_time - first_edge_time) / (rising_edges - 1);
             frequency = 1.0f / period;
 
-            // DEBUG: Log frequency measurement details (reduced to minimize CPU load)
-            static int freq_log_count = 0;
-            if (++freq_log_count % 100 == 1) {
-                std::ostringstream oss;
-                oss << "📊 FREQ: edges=" << rising_edges
-                    << " period=" << std::fixed << std::setprecision(6) << period
-                    << "s freq=" << std::setprecision(1) << frequency << "Hz"
-                    << " time_span=" << std::setprecision(6) << (last_edge_time - first_edge_time) << "s";
-                logger.log(oss.str());
-
-                // Show individual edge spacings to diagnose frequency issue
-                if (!edge_spacings.empty()) {
-                    std::ostringstream oss2;
-                    oss2 << "⏱️  PERIODS: ";
-                    for (size_t i = 0; i < std::min(edge_spacings.size(), size_t(5)); i++) {
-                        oss2 << std::fixed << std::setprecision(3) << (edge_spacings[i] * 1000.0f) << "ms ";
-                    }
-                    if (edge_spacings.size() > 5) {
-                        oss2 << "... (showing first 5 of " << edge_spacings.size() << ")";
-                    }
-                    logger.log(oss2.str());
-                }
-            }
+            // DEBUG logging disabled for performance
+            // static int freq_log_count = 0;
+            // if (++freq_log_count % 100 == 1) {
+            //     std::ostringstream oss;
+            //     oss << "📊 FREQ: edges=" << rising_edges
+            //         << " period=" << std::fixed << std::setprecision(6) << period
+            //         << "s freq=" << std::setprecision(1) << frequency << "Hz"
+            //         << " time_span=" << std::setprecision(6) << (last_edge_time - first_edge_time) << "s";
+            //     logger.log(oss.str());
+            //     if (!edge_spacings.empty()) {
+            //         std::ostringstream oss2;
+            //         oss2 << "⏱️  PERIODS: ";
+            //         for (size_t i = 0; i < std::min(edge_spacings.size(), size_t(5)); i++) {
+            //             oss2 << std::fixed << std::setprecision(3) << (edge_spacings[i] * 1000.0f) << "ms ";
+            //         }
+            //         if (edge_spacings.size() > 5) {
+            //             oss2 << "... (showing first 5 of " << edge_spacings.size() << ")";
+            //         }
+            //         logger.log(oss2.str());
+            //     }
+            // }
         }
 
         // Duty cycle - time above mid-level
@@ -1997,7 +1995,7 @@ public:
         
         timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, &MainWindow::update_display);
-        timer->start(60);  // 60ms = ~16.7 FPS (reduce from 50ms for less lag)
+        timer->start(30);  // 30ms = ~33 FPS for smoother display
     }
     
     ~MainWindow() {
