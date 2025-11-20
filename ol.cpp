@@ -40,6 +40,149 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
+#include <fstream>
+
+// ============================================================================
+// Rotary Encoder EC11 - GPIO Control
+// ============================================================================
+class RotaryEncoder {
+private:
+    int gpio_clk = 17;   // Pin 11
+    int gpio_dt = 27;    // Pin 13
+    int gpio_sw = 22;    // Pin 15
+
+    std::atomic<bool> running{false};
+    std::thread encoder_thread;
+
+    // Encoder state
+    int last_clk = 1;
+    int last_sw = 1;
+    std::chrono::steady_clock::time_point last_rotation_time;
+    std::chrono::steady_clock::time_point last_button_time;
+
+    // Callbacks
+    std::function<void(int)> on_rotate;  // +1 for CW, -1 for CCW
+    std::function<void()> on_button_press;
+
+    bool gpio_export(int pin) {
+        std::ofstream exp("/sys/class/gpio/export");
+        if (!exp.is_open()) return false;
+        exp << pin;
+        exp.close();
+        usleep(100000); // Wait for GPIO to be ready
+        return true;
+    }
+
+    bool gpio_set_direction(int pin, const std::string& dir) {
+        std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/direction";
+        std::ofstream dirfile(path);
+        if (!dirfile.is_open()) return false;
+        dirfile << dir;
+        dirfile.close();
+        return true;
+    }
+
+    int gpio_read(int pin) {
+        std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/value";
+        std::ifstream valfile(path);
+        if (!valfile.is_open()) return -1;
+        int value;
+        valfile >> value;
+        valfile.close();
+        return value;
+    }
+
+    void encoder_loop() {
+        while (running) {
+            auto now = std::chrono::steady_clock::now();
+
+            // Read current state
+            int clk = gpio_read(gpio_clk);
+            int dt = gpio_read(gpio_dt);
+            int sw = gpio_read(gpio_sw);
+
+            // Detect rotation (on CLK falling edge)
+            if (clk == 0 && last_clk == 1) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_rotation_time
+                ).count();
+
+                // Debounce: ignore if too fast (< 5ms)
+                if (elapsed > 5) {
+                    int direction = (dt == 0) ? 1 : -1;  // CW=+1, CCW=-1
+                    if (on_rotate) {
+                        on_rotate(direction);
+                    }
+                    last_rotation_time = now;
+                }
+            }
+
+            // Detect button press (on SW falling edge)
+            if (sw == 0 && last_sw == 1) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_button_time
+                ).count();
+
+                // Debounce: ignore if too fast (< 200ms)
+                if (elapsed > 200) {
+                    if (on_button_press) {
+                        on_button_press();
+                    }
+                    last_button_time = now;
+                }
+            }
+
+            last_clk = clk;
+            last_sw = sw;
+
+            usleep(1000);  // Poll every 1ms
+        }
+    }
+
+public:
+    RotaryEncoder() {
+        last_rotation_time = std::chrono::steady_clock::now();
+        last_button_time = last_rotation_time;
+    }
+
+    ~RotaryEncoder() {
+        stop();
+    }
+
+    bool init() {
+        // Export GPIOs
+        gpio_export(gpio_clk);
+        gpio_export(gpio_dt);
+        gpio_export(gpio_sw);
+
+        usleep(200000);
+
+        // Set as inputs
+        if (!gpio_set_direction(gpio_clk, "in")) return false;
+        if (!gpio_set_direction(gpio_dt, "in")) return false;
+        if (!gpio_set_direction(gpio_sw, "in")) return false;
+
+        return true;
+    }
+
+    void start() {
+        running = true;
+        encoder_thread = std::thread(&RotaryEncoder::encoder_loop, this);
+    }
+
+    void stop() {
+        running = false;
+        if (encoder_thread.joinable()) encoder_thread.join();
+    }
+
+    void set_rotation_callback(std::function<void(int)> callback) {
+        on_rotate = callback;
+    }
+
+    void set_button_callback(std::function<void()> callback) {
+        on_button_press = callback;
+    }
+};
 
 constexpr uint8_t  MARKER_START = 0xAA;
 constexpr uint8_t  MARKER_HEADER = 0x55;
@@ -1887,6 +2030,18 @@ private:
     QPushButton *slope_btn;
     QLabel *offset_label;
 
+    // Rotary Encoder EC11
+    RotaryEncoder encoder;
+    enum class EncoderMode { TIME, VOLTS };
+    EncoderMode encoder_mode = EncoderMode::TIME;
+    QLabel *encoder_mode_label;
+
+    // Time/Volts scales
+    std::vector<float> time_scales = {0.0001f, 0.0002f, 0.0005f, 0.001f, 0.002f, 0.005f};
+    std::vector<float> volt_scales = {0.5f, 1.0f, 2.0f};
+    int current_time_index = 3;  // Default: 1ms
+    int current_volt_index = 0;  // Default: 0.5V
+
     // Debounce for trigger level adjustment
     std::chrono::steady_clock::time_point last_trigger_adjust;
     const int TRIGGER_ADJUST_DEBOUNCE_MS = 100;  // Minimum 100ms between adjustments
@@ -1989,6 +2144,22 @@ public:
             update_offset_label();
         });
         panel_layout->addWidget(reset_pos_btn);
+
+        panel_layout->addSpacing(10);
+
+        // Rotary Encoder Mode Display
+        QLabel *enc_label = new QLabel("ENCODER MODE");
+        enc_label->setStyleSheet("color: #ffff00; font-weight: bold;");
+        panel_layout->addWidget(enc_label);
+
+        encoder_mode_label = new QLabel("🔄 TIME/DIV");
+        encoder_mode_label->setStyleSheet(
+            "color: white; background-color: #ff8800; "
+            "padding: 8px; font-weight: bold; font-size: 13px; "
+            "border-radius: 4px;"
+        );
+        encoder_mode_label->setAlignment(Qt::AlignCenter);
+        panel_layout->addWidget(encoder_mode_label);
 
         panel_layout->addSpacing(15);
 
@@ -2102,13 +2273,29 @@ public:
         }
         
         reader.start();
-        
+
+        // Initialize Rotary Encoder EC11
+        if (encoder.init()) {
+            // Setup rotation callback
+            encoder.set_rotation_callback([this](int direction) {
+                handle_encoder_rotation(direction);
+            });
+
+            // Setup button callback (toggle mode)
+            encoder.set_button_callback([this]() {
+                toggle_encoder_mode();
+            });
+
+            encoder.start();
+        }
+
         timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, &MainWindow::update_display);
         timer->start(30);  // 30ms = ~33 FPS for smoother display
     }
     
     ~MainWindow() {
+        encoder.stop();
         reader.stop();
     }
 
@@ -2250,6 +2437,65 @@ private slots:
             ? QString("%1µs").arg(h * 1e6f, 0, 'f', 1)
             : QString("%1ms").arg(h * 1e3f, 0, 'f', 2);
         offset_label->setText(QString("H: %1  V: %2V").arg(h_str).arg(v, 0, 'f', 2));
+    }
+
+    // Rotary Encoder: Handle rotation
+    void handle_encoder_rotation(int direction) {
+        if (encoder_mode == EncoderMode::TIME) {
+            // Adjust Time/Div
+            current_time_index += direction;
+            current_time_index = std::max(0, std::min((int)time_scales.size() - 1, current_time_index));
+            display->set_time_div(time_scales[current_time_index]);
+
+            // Update label
+            QString scale_str;
+            float val = time_scales[current_time_index];
+            if (val < 0.001f) {
+                scale_str = QString("%1µs").arg(val * 1e6f, 0, 'f', 0);
+            } else {
+                scale_str = QString("%1ms").arg(val * 1e3f, 0, 'f', 1);
+            }
+            encoder_mode_label->setText(QString("🔄 TIME: %1").arg(scale_str));
+
+        } else {
+            // Adjust Volts/Div
+            current_volt_index += direction;
+            current_volt_index = std::max(0, std::min((int)volt_scales.size() - 1, current_volt_index));
+            display->set_volt_div(volt_scales[current_volt_index]);
+
+            // Update label
+            QString scale_str = QString("%1V").arg(volt_scales[current_volt_index], 0, 'f', 1);
+            encoder_mode_label->setText(QString("⚡ VOLTS: %1").arg(scale_str));
+        }
+    }
+
+    // Rotary Encoder: Toggle mode (button press)
+    void toggle_encoder_mode() {
+        if (encoder_mode == EncoderMode::TIME) {
+            encoder_mode = EncoderMode::VOLTS;
+            QString scale_str = QString("%1V").arg(volt_scales[current_volt_index], 0, 'f', 1);
+            encoder_mode_label->setText(QString("⚡ VOLTS: %1").arg(scale_str));
+            encoder_mode_label->setStyleSheet(
+                "color: white; background-color: #00aa00; "
+                "padding: 8px; font-weight: bold; font-size: 13px; "
+                "border-radius: 4px;"
+            );
+        } else {
+            encoder_mode = EncoderMode::TIME;
+            float val = time_scales[current_time_index];
+            QString scale_str;
+            if (val < 0.001f) {
+                scale_str = QString("%1µs").arg(val * 1e6f, 0, 'f', 0);
+            } else {
+                scale_str = QString("%1ms").arg(val * 1e3f, 0, 'f', 1);
+            }
+            encoder_mode_label->setText(QString("🔄 TIME: %1").arg(scale_str));
+            encoder_mode_label->setStyleSheet(
+                "color: white; background-color: #ff8800; "
+                "padding: 8px; font-weight: bold; font-size: 13px; "
+                "border-radius: 4px;"
+            );
+        }
     }
 
 protected:
