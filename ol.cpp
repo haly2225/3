@@ -232,6 +232,11 @@ private:
     // Trigger slope (rising/falling edge)
     std::atomic<TriggerSlope> trigger_slope{TriggerSlope::RISING};
 
+    // Auto Trigger 50% (automatically set trigger to mid-point)
+    std::atomic<bool> auto_trigger_50_percent{false};
+    float last_vmax = 3.3f;
+    float last_vmin = 0.0f;
+
     // Pre-trigger samples (show waveform BEFORE trigger point)
     static constexpr int PRE_TRIGGER_SAMPLES = 100;  // Show 100 samples before edge
 
@@ -294,6 +299,15 @@ public:
     }
 
     float getTriggerLevel() const { return trigger_level.load(); }
+
+    // Auto Trigger 50% control
+    void set_auto_trigger_50(bool enabled) {
+        auto_trigger_50_percent = enabled;
+        std::string status = enabled ? "ENABLED" : "DISABLED";
+        logger.log("🎯 Auto Trigger 50%: " + status);
+    }
+
+    bool get_auto_trigger_50() const { return auto_trigger_50_percent.load(); }
 
     bool init() {
         logger.log("🔧 Init SPI...");
@@ -576,6 +590,27 @@ private:
         }
         float vpp = vmax - vmin;
         last_vpp = vpp;
+
+        // Auto Trigger 50%: automatically set trigger to mid-point of signal
+        if (auto_trigger_50_percent.load() && vpp > 0.5f) {
+            last_vmax = vmax;
+            last_vmin = vmin;
+            float mid_level = (vmax + vmin) / 2.0f;
+
+            // Only update if change is significant (> 20mV) to avoid jitter
+            if (std::abs(mid_level - trigger_level.load()) > 0.02f) {
+                trigger_level.store(mid_level);
+
+                // Log occasionally (every 100 updates)
+                static int auto_trig_log_count = 0;
+                if (++auto_trig_log_count % 100 == 1) {
+                    std::ostringstream oss;
+                    oss << "🎯 Auto 50%: " << std::fixed << std::setprecision(2)
+                        << mid_level << "V (Vmax=" << vmax << "V, Vmin=" << vmin << "V)";
+                    logger.log(oss.str());
+                }
+            }
+        }
 
         // DEBUG logging disabled for performance
         // static int debug_counter = 0;
@@ -1858,6 +1893,20 @@ public:
         });
         panel_layout->addWidget(phase_lock_btn);
 
+        // Auto Trigger 50% control
+        QPushButton *auto_trig_50_btn = new QPushButton("🎯 AUTO 50%: OFF");
+        auto_trig_50_btn->setCheckable(true);
+        auto_trig_50_btn->setChecked(false);
+        auto_trig_50_btn->setStyleSheet(
+            "QPushButton { background-color: #555; color: white; padding: 6px; font-weight: bold; }"
+            "QPushButton:checked { background-color: #ff8800; color: white; }"
+        );
+        connect(auto_trig_50_btn, &QPushButton::toggled, [this, auto_trig_50_btn](bool checked) {
+            reader.set_auto_trigger_50(checked);
+            auto_trig_50_btn->setText(checked ? "🎯 AUTO 50%: ON" : "🎯 AUTO 50%: OFF");
+        });
+        panel_layout->addWidget(auto_trig_50_btn);
+
         panel_layout->addSpacing(10);
 
         // H/V Position Offset
@@ -2242,6 +2291,10 @@ protected:
             case Qt::Key_G:
                 // Toggle glow effect
                 display->toggle_glow();
+                return;
+            case Qt::Key_A:
+                // Toggle Auto Trigger 50%
+                reader.set_auto_trigger_50(!reader.get_auto_trigger_50());
                 return;
 
             // Playback frame navigation
