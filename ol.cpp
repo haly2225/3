@@ -66,8 +66,17 @@ private:
 
     bool gpio_export(int pin) {
         std::ofstream exp("/sys/class/gpio/export");
-        if (!exp.is_open()) return false;
+        if (!exp.is_open()) {
+            std::cout << "❌ Encoder: Cannot open /sys/class/gpio/export (need sudo?)" << std::endl;
+            return false;
+        }
         exp << pin;
+        if (exp.fail()) {
+            // Pin might already be exported
+            std::cout << "⚠️  Encoder: GPIO " << pin << " already exported (OK)" << std::endl;
+        } else {
+            std::cout << "✅ Encoder: GPIO " << pin << " exported" << std::endl;
+        }
         exp.close();
         usleep(100000); // Wait for GPIO to be ready
         return true;
@@ -76,9 +85,13 @@ private:
     bool gpio_set_direction(int pin, const std::string& dir) {
         std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/direction";
         std::ofstream dirfile(path);
-        if (!dirfile.is_open()) return false;
+        if (!dirfile.is_open()) {
+            std::cout << "❌ Encoder: Cannot set direction for GPIO " << pin << std::endl;
+            return false;
+        }
         dirfile << dir;
         dirfile.close();
+        std::cout << "✅ Encoder: GPIO " << pin << " direction set to " << dir << std::endl;
         return true;
     }
 
@@ -93,6 +106,21 @@ private:
     }
 
     void encoder_loop() {
+        std::cout << "🔄 Encoder: Loop started" << std::endl;
+
+        // Log initial GPIO values
+        int init_clk = gpio_read(gpio_clk);
+        int init_dt = gpio_read(gpio_dt);
+        int init_sw = gpio_read(gpio_sw);
+        std::cout << "🔄 Encoder: Initial values - CLK=" << init_clk
+                  << " DT=" << init_dt << " SW=" << init_sw << std::endl;
+
+        if (init_clk < 0 || init_dt < 0 || init_sw < 0) {
+            std::cout << "❌ Encoder: GPIO read failed! Check permissions (need sudo?)" << std::endl;
+            return;
+        }
+
+        int loop_count = 0;
         while (running) {
             auto now = std::chrono::steady_clock::now();
 
@@ -101,15 +129,31 @@ private:
             int dt = gpio_read(gpio_dt);
             int sw = gpio_read(gpio_sw);
 
+            // Debug: log first 5 reads and any changes
+            if (loop_count < 5 || clk != last_clk || sw != last_sw) {
+                if (loop_count < 5) {
+                    std::cout << "🔄 Encoder: Loop " << loop_count
+                              << " - CLK=" << clk << " DT=" << dt << " SW=" << sw << std::endl;
+                }
+                if (clk != last_clk || sw != last_sw) {
+                    std::cout << "🔄 Encoder: Change detected - CLK: " << last_clk << "→" << clk
+                              << " DT: " << dt << " SW: " << last_sw << "→" << sw << std::endl;
+                }
+            }
+
             // Detect rotation (on CLK falling edge)
             if (clk == 0 && last_clk == 1) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_rotation_time
                 ).count();
 
+                std::cout << "🔄 Encoder: CLK falling edge detected! DT=" << dt
+                          << " elapsed=" << elapsed << "ms" << std::endl;
+
                 // Debounce: ignore if too fast (< 5ms)
                 if (elapsed > 5) {
                     int direction = (dt == 0) ? 1 : -1;  // CW=+1, CCW=-1
+                    std::cout << "🎯 Encoder: ROTATION " << (direction > 0 ? "CW" : "CCW") << std::endl;
                     if (on_rotate) {
                         on_rotate(direction);
                     }
@@ -123,8 +167,11 @@ private:
                     now - last_button_time
                 ).count();
 
+                std::cout << "🔄 Encoder: SW falling edge detected! elapsed=" << elapsed << "ms" << std::endl;
+
                 // Debounce: ignore if too fast (< 200ms)
                 if (elapsed > 200) {
+                    std::cout << "🎯 Encoder: BUTTON PRESSED" << std::endl;
                     if (on_button_press) {
                         on_button_press();
                     }
@@ -135,8 +182,11 @@ private:
             last_clk = clk;
             last_sw = sw;
 
+            loop_count++;
             usleep(1000);  // Poll every 1ms
         }
+
+        std::cout << "🔄 Encoder: Loop stopped" << std::endl;
     }
 
 public:
@@ -150,18 +200,39 @@ public:
     }
 
     bool init() {
+        std::cout << "🔧 Encoder: Initializing EC11 on GPIO 17, 27, 22..." << std::endl;
+
         // Export GPIOs
-        gpio_export(gpio_clk);
-        gpio_export(gpio_dt);
-        gpio_export(gpio_sw);
+        if (!gpio_export(gpio_clk)) {
+            std::cout << "❌ Encoder: Init failed - cannot export GPIO" << std::endl;
+            return false;
+        }
+        if (!gpio_export(gpio_dt)) {
+            std::cout << "❌ Encoder: Init failed - cannot export GPIO" << std::endl;
+            return false;
+        }
+        if (!gpio_export(gpio_sw)) {
+            std::cout << "❌ Encoder: Init failed - cannot export GPIO" << std::endl;
+            return false;
+        }
 
         usleep(200000);
 
         // Set as inputs
-        if (!gpio_set_direction(gpio_clk, "in")) return false;
-        if (!gpio_set_direction(gpio_dt, "in")) return false;
-        if (!gpio_set_direction(gpio_sw, "in")) return false;
+        if (!gpio_set_direction(gpio_clk, "in")) {
+            std::cout << "❌ Encoder: Init failed - cannot set direction" << std::endl;
+            return false;
+        }
+        if (!gpio_set_direction(gpio_dt, "in")) {
+            std::cout << "❌ Encoder: Init failed - cannot set direction" << std::endl;
+            return false;
+        }
+        if (!gpio_set_direction(gpio_sw, "in")) {
+            std::cout << "❌ Encoder: Init failed - cannot set direction" << std::endl;
+            return false;
+        }
 
+        std::cout << "✅ Encoder: Init OK!" << std::endl;
         return true;
     }
 
@@ -2275,18 +2346,27 @@ public:
         reader.start();
 
         // Initialize Rotary Encoder EC11
+        std::cout << "🔧 MainWindow: Initializing Rotary Encoder..." << std::endl;
         if (encoder.init()) {
+            std::cout << "✅ MainWindow: Encoder init success, setting up callbacks..." << std::endl;
+
             // Setup rotation callback
             encoder.set_rotation_callback([this](int direction) {
+                std::cout << "🎯 MainWindow: Encoder callback - direction=" << direction << std::endl;
                 handle_encoder_rotation(direction);
             });
 
             // Setup button callback (toggle mode)
             encoder.set_button_callback([this]() {
+                std::cout << "🎯 MainWindow: Encoder button callback" << std::endl;
                 toggle_encoder_mode();
             });
 
+            std::cout << "▶️  MainWindow: Starting encoder thread..." << std::endl;
             encoder.start();
+            std::cout << "✅ MainWindow: Encoder started!" << std::endl;
+        } else {
+            std::cout << "❌ MainWindow: Encoder init failed! Run with sudo?" << std::endl;
         }
 
         timer = new QTimer(this);
