@@ -72,9 +72,12 @@ class RotaryEncoder:
         self.gpio_sw = 22   # Pin 15
 
         self.running = False
+        self.use_interrupt = False  # Will be set during init
+        self.polling_thread = None
 
         self.last_clk = 1
         self.last_sw = 1
+        self.last_dt = 1
         self.last_rotation_time = time.time()
         self.last_button_time = time.time()
 
@@ -87,13 +90,13 @@ class RotaryEncoder:
         self.last_direction = 0  # 1=CW, -1=CCW
 
     def init(self):
-        """Initialize GPIO using RPi.GPIO with interrupts"""
+        """Initialize GPIO using RPi.GPIO with interrupts (fallback to polling)"""
         if GPIO is None:
             print("❌ Encoder: RPi.GPIO not available")
             return False
 
         try:
-            print("🔧 Encoder: Initializing EC11 using RPi.GPIO (INTERRUPT mode)...")
+            print("🔧 Encoder: Initializing EC11 using RPi.GPIO...")
 
             # Setup GPIO mode
             GPIO.setmode(GPIO.BCM)
@@ -106,15 +109,30 @@ class RotaryEncoder:
 
             print("✅ Encoder: GPIO 17, 27, 22 configured as inputs with pull-up")
 
-            # Add interrupt callbacks (FALLING edge detection)
-            GPIO.add_event_detect(self.gpio_clk, GPIO.FALLING,
-                                  callback=self._clk_callback,
-                                  bouncetime=5)  # 5ms debounce
-            GPIO.add_event_detect(self.gpio_sw, GPIO.FALLING,
-                                  callback=self._sw_callback,
-                                  bouncetime=200)  # 200ms debounce
+            # Try to add interrupt callbacks
+            try:
+                # Remove any existing event detection first
+                try:
+                    GPIO.remove_event_detect(self.gpio_clk)
+                    GPIO.remove_event_detect(self.gpio_sw)
+                except:
+                    pass
 
-            print("✅ Encoder: Interrupts configured (CLK=5ms, SW=200ms debounce)")
+                # Add interrupt callbacks (FALLING edge detection)
+                GPIO.add_event_detect(self.gpio_clk, GPIO.FALLING,
+                                      callback=self._clk_callback,
+                                      bouncetime=5)  # 5ms debounce
+                GPIO.add_event_detect(self.gpio_sw, GPIO.FALLING,
+                                      callback=self._sw_callback,
+                                      bouncetime=200)  # 200ms debounce
+
+                print("✅ Encoder: INTERRUPT mode configured (CLK=5ms, SW=200ms debounce)")
+                self.use_interrupt = True
+            except Exception as e:
+                print(f"⚠️  Encoder: Interrupt setup failed ({e})")
+                print("📌 Encoder: Falling back to POLLING mode (1ms)")
+                self.use_interrupt = False
+
             print("✅ Encoder: Init OK!")
             return True
         except Exception as e:
@@ -165,22 +183,89 @@ class RotaryEncoder:
         if self.on_button_press:
             self.on_button_press()
 
+    def _polling_loop(self):
+        """Polling loop fallback when interrupts fail"""
+        print("🔄 Encoder: Polling loop started (1ms interval)")
+
+        while self.running:
+            now = time.time()
+
+            # Read current GPIO states
+            clk = GPIO.input(self.gpio_clk)
+            dt = GPIO.input(self.gpio_dt)
+            sw = GPIO.input(self.gpio_sw)
+
+            # Detect rotation (CLK falling edge)
+            if clk == 0 and self.last_clk == 1:
+                elapsed = (now - self.last_rotation_time) * 1000
+
+                # Debounce check
+                if elapsed > 5:
+                    # Determine direction from DT state
+                    direction = 1 if dt == 1 else -1
+
+                    self.rotation_count += 1
+                    self.last_direction = direction
+                    self.last_rotation_time = now
+
+                    print(f"🎯 Encoder: ROTATION #{self.rotation_count} {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt}, {elapsed:.1f}ms)")
+
+                    # Call user callback
+                    if self.on_rotate:
+                        self.on_rotate(direction)
+
+            # Detect button press (SW falling edge)
+            if sw == 0 and self.last_sw == 1:
+                elapsed = (now - self.last_button_time) * 1000
+
+                # Debounce check
+                if elapsed > 200:
+                    self.button_count += 1
+                    self.last_button_time = now
+
+                    print(f"🎯 Encoder: BUTTON PRESSED #{self.button_count} ({elapsed:.1f}ms)")
+
+                    # Call user callback
+                    if self.on_button_press:
+                        self.on_button_press()
+
+            # Update last states
+            self.last_clk = clk
+            self.last_dt = dt
+            self.last_sw = sw
+
+            # Sleep 1ms (faster than original 10ms, better response)
+            time.sleep(0.001)
+
     def start(self):
-        """Start encoder (interrupts already active)"""
+        """Start encoder (interrupts or polling mode)"""
         self.running = True
-        print("✅ Encoder: Interrupt mode active (no polling thread needed)")
+
+        if self.use_interrupt:
+            print("✅ Encoder: INTERRUPT mode active (no polling thread needed)")
+        else:
+            # Start polling thread
+            self.polling_thread = threading.Thread(target=self._polling_loop, daemon=True)
+            self.polling_thread.start()
+            print("✅ Encoder: POLLING mode active (1ms interval)")
 
     def stop(self):
         """Stop encoder and cleanup"""
         self.running = False
 
+        # Wait for polling thread to finish
+        if self.polling_thread and self.polling_thread.is_alive():
+            self.polling_thread.join(timeout=1.0)
+            print("✅ Encoder: Polling thread stopped")
+
         # Remove interrupt callbacks
-        try:
-            GPIO.remove_event_detect(self.gpio_clk)
-            GPIO.remove_event_detect(self.gpio_sw)
-            print("✅ Encoder: Interrupts removed")
-        except:
-            pass
+        if self.use_interrupt:
+            try:
+                GPIO.remove_event_detect(self.gpio_clk)
+                GPIO.remove_event_detect(self.gpio_sw)
+                print("✅ Encoder: Interrupts removed")
+            except:
+                pass
 
         # Cleanup GPIO
         try:
@@ -335,17 +420,34 @@ class SPIReader:
             return voltages, times
 
     def calculate_frequency(self, voltages):
-        """Calculate frequency from zero crossings"""
+        """Calculate frequency from zero crossings (with noise filtering)"""
         if len(voltages) < 10:
             return 0.0
 
-        # Find average (mid-level)
+        # Calculate signal metrics
+        vmax = max(voltages)
+        vmin = min(voltages)
+        vpp = vmax - vmin
         avg = sum(voltages) / len(voltages)
 
-        # Count zero crossings (rising edges only)
+        # Filter out noise: signal must have at least 300mV amplitude
+        if vpp < 0.3:
+            # Debug: Signal too small
+            if not hasattr(self, '_freq_debug_count'):
+                self._freq_debug_count = 0
+            self._freq_debug_count += 1
+            if self._freq_debug_count % 100 == 0:
+                print(f"📉 Freq: Signal too small (Vpp={vpp:.3f}V < 0.3V threshold)")
+            return 0.0
+
+        # Hysteresis threshold: 10% of Vpp to avoid counting noise
+        threshold = vpp * 0.10  # 10% of peak-to-peak
+
+        # Count zero crossings (rising edges only) with hysteresis
         crossings = 0
         for i in range(1, len(voltages)):
-            if voltages[i-1] < avg and voltages[i] >= avg:
+            # Must cross from below (avg - threshold) to above (avg + threshold)
+            if voltages[i-1] < (avg - threshold) and voltages[i] >= (avg + threshold):
                 crossings += 1
 
         if crossings < 2:
@@ -354,6 +456,14 @@ class SPIReader:
         # Calculate period and frequency
         total_time = len(voltages) / SAMPLE_RATE
         frequency = crossings / total_time
+
+        # Debug: Show frequency calculation details periodically
+        if not hasattr(self, '_freq_calc_count'):
+            self._freq_calc_count = 0
+        self._freq_calc_count += 1
+        if self._freq_calc_count % 50 == 0:  # Every 50 calculations
+            print(f"🔍 Freq: {crossings} crossings in {total_time*1000:.1f}ms = {frequency:.1f}Hz "
+                  f"(Vpp={vpp:.2f}V, threshold={threshold:.3f}V, avg={avg:.2f}V)")
 
         return frequency
 
@@ -401,6 +511,9 @@ class SPIReader:
         """Main SPI reader loop"""
         print("🔄 SPI: Reader loop started")
 
+        loop_count = 0
+        last_debug_time = time.time()
+
         while self.running:
             samples = self.read_packet()
             if samples:
@@ -409,6 +522,17 @@ class SPIReader:
                 with self.lock:
                     self.voltage_buffer = voltages
                     self.time_buffer = times
+
+                loop_count += 1
+
+                # Print debug stats every 5 seconds
+                now = time.time()
+                if now - last_debug_time >= 5.0:
+                    sync_rate = 100.0 * self.sync_ok_count / max(1, self.packet_count)
+                    print(f"📊 SPI Stats: Packets={self.packet_count}, Sync={sync_rate:.1f}%, "
+                          f"Triggers={self.trigger_found_count}, Loops={loop_count}")
+                    print(f"📈 Signal: Vpp={self.vpp_latest:.2f}V, Freq={self.frequency_latest:.1f}Hz")
+                    last_debug_time = now
             else:
                 time.sleep(0.001)
 
