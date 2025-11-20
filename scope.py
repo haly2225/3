@@ -63,7 +63,7 @@ class TriggerSlope(Enum):
     FALLING = 1
 
 # ============================================================================
-# Rotary Encoder EC11 - GPIO Control (RPi.GPIO)
+# Rotary Encoder EC11 - GPIO Control (Interrupt-based)
 # ============================================================================
 class RotaryEncoder:
     def __init__(self):
@@ -72,7 +72,6 @@ class RotaryEncoder:
         self.gpio_sw = 22   # Pin 15
 
         self.running = False
-        self.thread = None
 
         self.last_clk = 1
         self.last_sw = 1
@@ -88,13 +87,13 @@ class RotaryEncoder:
         self.last_direction = 0  # 1=CW, -1=CCW
 
     def init(self):
-        """Initialize GPIO using RPi.GPIO"""
+        """Initialize GPIO using RPi.GPIO with interrupts"""
         if GPIO is None:
             print("❌ Encoder: RPi.GPIO not available")
             return False
 
         try:
-            print("🔧 Encoder: Initializing EC11 using RPi.GPIO...")
+            print("🔧 Encoder: Initializing EC11 using RPi.GPIO (INTERRUPT mode)...")
 
             # Setup GPIO mode
             GPIO.setmode(GPIO.BCM)
@@ -106,87 +105,82 @@ class RotaryEncoder:
             GPIO.setup(self.gpio_sw, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
             print("✅ Encoder: GPIO 17, 27, 22 configured as inputs with pull-up")
+
+            # Add interrupt callbacks (FALLING edge detection)
+            GPIO.add_event_detect(self.gpio_clk, GPIO.FALLING,
+                                  callback=self._clk_callback,
+                                  bouncetime=5)  # 5ms debounce
+            GPIO.add_event_detect(self.gpio_sw, GPIO.FALLING,
+                                  callback=self._sw_callback,
+                                  bouncetime=200)  # 200ms debounce
+
+            print("✅ Encoder: Interrupts configured (CLK=5ms, SW=200ms debounce)")
             print("✅ Encoder: Init OK!")
             return True
         except Exception as e:
             print(f"❌ Encoder: Init failed - {e}")
             return False
 
-    def encoder_loop(self):
-        """Main encoder polling loop"""
-        print("🔄 Encoder: Loop started")
+    def _clk_callback(self, channel):
+        """Interrupt callback for CLK falling edge (rotation detected)"""
+        now = time.time()
+        elapsed = (now - self.last_rotation_time) * 1000
 
-        # Log initial values
-        init_clk = GPIO.input(self.gpio_clk)
-        init_dt = GPIO.input(self.gpio_dt)
-        init_sw = GPIO.input(self.gpio_sw)
-        print(f"🔄 Encoder: Initial values - CLK={init_clk} DT={init_dt} SW={init_sw}")
+        # Additional software debounce check
+        if elapsed < 5:
+            return
 
-        loop_count = 0
-        while self.running:
-            now = time.time()
+        # Read DT state to determine direction
+        dt = GPIO.input(self.gpio_dt)
 
-            # Read current state
-            clk = GPIO.input(self.gpio_clk)
-            dt = GPIO.input(self.gpio_dt)
-            sw = GPIO.input(self.gpio_sw)
+        # FIXED: CW (clockwise) = DT is HIGH (1) at falling edge
+        # CCW (counter-clockwise) = DT is LOW (0) at falling edge
+        direction = 1 if dt == 1 else -1
 
-            # Debug first 5 reads
-            if loop_count < 5:
-                print(f"🔄 Encoder: Loop {loop_count} - CLK={clk} DT={dt} SW={sw}")
+        self.rotation_count += 1
+        self.last_direction = direction
+        self.last_rotation_time = now
 
-            # Detect rotation (CLK falling edge)
-            if clk == 0 and self.last_clk == 1:
-                elapsed = (now - self.last_rotation_time) * 1000
+        print(f"🎯 Encoder: ROTATION #{self.rotation_count} {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt}, {elapsed:.1f}ms)")
 
-                # Debug
-                if loop_count < 10 or elapsed > 5:
-                    print(f"🔄 Encoder: CLK falling edge! DT={dt} elapsed={elapsed:.1f}ms")
+        # Call user callback
+        if self.on_rotate:
+            self.on_rotate(direction)
 
-                # Debounce (> 5ms)
-                if elapsed > 5:
-                    # FIXED: CW (clockwise) = DT is HIGH (1) at falling edge
-                    # CCW (counter-clockwise) = DT is LOW (0) at falling edge
-                    direction = 1 if dt == 1 else -1
-                    self.rotation_count += 1
-                    self.last_direction = direction
-                    print(f"🎯 Encoder: ROTATION #{self.rotation_count} {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt})")
-                    if self.on_rotate:
-                        self.on_rotate(direction)
-                    self.last_rotation_time = now
+    def _sw_callback(self, channel):
+        """Interrupt callback for SW falling edge (button pressed)"""
+        now = time.time()
+        elapsed = (now - self.last_button_time) * 1000
 
-            # Detect button press (SW falling edge)
-            if sw == 0 and self.last_sw == 1:
-                elapsed = (now - self.last_button_time) * 1000
-                print(f"🔄 Encoder: SW falling edge! elapsed={elapsed:.1f}ms")
+        # Additional software debounce check
+        if elapsed < 200:
+            return
 
-                # Debounce (> 200ms)
-                if elapsed > 200:
-                    self.button_count += 1
-                    print(f"🎯 Encoder: BUTTON PRESSED #{self.button_count}")
-                    if self.on_button_press:
-                        self.on_button_press()
-                    self.last_button_time = now
+        self.button_count += 1
+        self.last_button_time = now
 
-            self.last_clk = clk
-            self.last_sw = sw
+        print(f"🎯 Encoder: BUTTON PRESSED #{self.button_count} ({elapsed:.1f}ms)")
 
-            loop_count += 1
-            time.sleep(0.01)  # Poll every 10ms
-
-        print("🔄 Encoder: Loop stopped")
+        # Call user callback
+        if self.on_button_press:
+            self.on_button_press()
 
     def start(self):
-        """Start encoder thread"""
+        """Start encoder (interrupts already active)"""
         self.running = True
-        self.thread = threading.Thread(target=self.encoder_loop, daemon=True)
-        self.thread.start()
+        print("✅ Encoder: Interrupt mode active (no polling thread needed)")
 
     def stop(self):
-        """Stop encoder thread"""
+        """Stop encoder and cleanup"""
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
+
+        # Remove interrupt callbacks
+        try:
+            GPIO.remove_event_detect(self.gpio_clk)
+            GPIO.remove_event_detect(self.gpio_sw)
+            print("✅ Encoder: Interrupts removed")
+        except:
+            pass
 
         # Cleanup GPIO
         try:
@@ -364,21 +358,24 @@ class SPIReader:
         return frequency
 
     def find_trigger_edge(self, voltages):
-        """Find trigger edge in waveform"""
+        """Find trigger edge in waveform with hysteresis"""
         if len(voltages) < 10:
             return -1
 
         level = self.trigger_level
+        hysteresis = 0.05  # 50mV hysteresis to avoid noise
 
-        # Search for edge
+        # Search for edge with hysteresis
         for i in range(1, len(voltages) - 1):
             if self.trigger_slope == TriggerSlope.RISING:
-                # Rising edge
-                if voltages[i-1] < level and voltages[i] >= level:
+                # Rising edge with hysteresis:
+                # Must go below (level - hysteresis) then cross level
+                if voltages[i-1] < (level - hysteresis) and voltages[i] >= level:
                     return i
             else:
-                # Falling edge
-                if voltages[i-1] > level and voltages[i] <= level:
+                # Falling edge with hysteresis:
+                # Must go above (level + hysteresis) then cross level
+                if voltages[i-1] > (level + hysteresis) and voltages[i] <= level:
                     return i
 
         return -1
@@ -480,6 +477,9 @@ class ScopeDisplay(QWidget):
         self.trace_color = QColor(0, 255, 0)
         self.trigger_color = QColor(255, 255, 0)
 
+        # Drawing mode: 'line' or 'step'
+        self.draw_mode = 'step'  # Step mode for square wave visualization
+
     def set_data(self, voltages, times):
         """Update waveform data"""
         self.voltages = voltages
@@ -565,7 +565,7 @@ class ScopeDisplay(QWidget):
             painter.drawLine(0, int(y), w, int(y))
 
     def draw_waveform(self, painter, w, h):
-        """Draw waveform trace"""
+        """Draw waveform trace (line or step mode)"""
         if not self.voltages or len(self.voltages) < 2:
             return
 
@@ -575,24 +575,49 @@ class ScopeDisplay(QWidget):
         v_range = self.volt_div * 4  # 4 divisions above/below center
         t_range = self.time_div * 10  # 10 divisions
 
-        for i in range(len(self.voltages) - 1):
-            if i >= len(self.times):
-                break
+        if self.draw_mode == 'step':
+            # Step drawing (better for square waves)
+            for i in range(len(self.voltages) - 1):
+                if i >= len(self.times):
+                    break
 
-            # Convert to screen coordinates
-            t1 = self.times[i]
-            v1 = self.voltages[i]
-            t2 = self.times[i+1]
-            v2 = self.voltages[i+1]
+                # Convert to screen coordinates
+                t1 = self.times[i]
+                v1 = self.voltages[i]
+                t2 = self.times[i+1]
+                v2 = self.voltages[i+1]
 
-            x1 = (t1 / t_range) * w
-            y1 = h / 2 + (v_center - v1) / v_range * (h / 2)
-            x2 = (t2 / t_range) * w
-            y2 = h / 2 + (v_center - v2) / v_range * (h / 2)
+                x1 = (t1 / t_range) * w
+                y1 = h / 2 + (v_center - v1) / v_range * (h / 2)
+                x2 = (t2 / t_range) * w
+                y2 = h / 2 + (v_center - v2) / v_range * (h / 2)
 
-            # Clip to screen
-            if 0 <= x1 <= w and 0 <= x2 <= w:
-                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                # Clip to screen
+                if 0 <= x1 <= w and 0 <= x2 <= w:
+                    # Draw horizontal line at v1 level
+                    painter.drawLine(int(x1), int(y1), int(x2), int(y1))
+                    # Draw vertical line to v2 level
+                    painter.drawLine(int(x2), int(y1), int(x2), int(y2))
+        else:
+            # Line drawing (original)
+            for i in range(len(self.voltages) - 1):
+                if i >= len(self.times):
+                    break
+
+                # Convert to screen coordinates
+                t1 = self.times[i]
+                v1 = self.voltages[i]
+                t2 = self.times[i+1]
+                v2 = self.voltages[i+1]
+
+                x1 = (t1 / t_range) * w
+                y1 = h / 2 + (v_center - v1) / v_range * (h / 2)
+                x2 = (t2 / t_range) * w
+                y2 = h / 2 + (v_center - v2) / v_range * (h / 2)
+
+                # Clip to screen
+                if 0 <= x1 <= w and 0 <= x2 <= w:
+                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
     def draw_info(self, painter, w, h):
         """Draw info text"""
