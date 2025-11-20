@@ -463,9 +463,13 @@ private:
         std::vector<uint8_t> tx_buf(PACKET_SIZE, 0x00);
 
         // logger.log("🔁 Loop start");  // Disabled for performance
+        logger.log("🔁 Loop start - waiting for STM32 data...");
         last_signal_time = std::chrono::steady_clock::now();
         last_auto_switch_time = last_signal_time;
-        
+
+        int loop_counter = 0;
+        int no_sync_warning_shown = 0;
+
         while (running) {
             struct spi_ioc_transfer tr{};
             tr.tx_buf = reinterpret_cast<uint64_t>(tx_buf.data());
@@ -481,12 +485,25 @@ private:
 
             // Removed usleep(600) - SPI 16MHz needs full speed to keep up with STM32
             stats.total_packets++;
-            
+            loop_counter++;
+
             auto now = std::chrono::steady_clock::now();
-            
+
             if (parse_packet(rx_buf)) {
                 stats.good_packets++;
                 frame_count++;
+            } else {
+                // Debug: log first packet failures
+                if (no_sync_warning_shown < 3) {
+                    no_sync_warning_shown++;
+                    std::ostringstream oss;
+                    oss << "⚠️  No sync after " << loop_counter << " loops. First 10 bytes: ";
+                    for (int i = 0; i < 10 && i < (int)rx_buf.size(); i++) {
+                        oss << "0x" << std::hex << std::setw(2) << std::setfill('0')
+                            << (int)rx_buf[i] << " ";
+                    }
+                    logger.log(oss.str());
+                }
             }
             
             // Signal timeout check
@@ -528,7 +545,21 @@ private:
             }
         }
 
-        if (marker_pos < 0) return false;
+        if (marker_pos < 0) {
+            // Debug: check if all zeros (no data from STM32)
+            static int all_zero_count = 0;
+            bool all_zero = true;
+            for (size_t i = 0; i < buf.size() && i < 100; i++) {
+                if (buf[i] != 0x00) {
+                    all_zero = false;
+                    break;
+                }
+            }
+            if (all_zero && all_zero_count++ < 2) {
+                logger.log("⚠️  SPI reads all 0x00 - STM32 not sending data or not connected");
+            }
+            return false;
+        }
 
         uint16_t frame_num = (static_cast<uint16_t>(buf[marker_pos + 2]) << 8) |
                              buf[marker_pos + 3];
