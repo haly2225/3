@@ -388,6 +388,17 @@ class SPIReader:
         # Calculate frequency (count zero crossings)
         self.frequency_latest = self.calculate_frequency(voltages)
 
+        # Detect signal clipping (touching ADC limits)
+        is_clipped = (vmax >= 3.25) or (vmin <= 0.05)
+        if is_clipped:
+            if not hasattr(self, '_clipping_warn_count'):
+                self._clipping_warn_count = 0
+            self._clipping_warn_count += 1
+            # Warn every 200 packets (not too spammy)
+            if self._clipping_warn_count % 200 == 0:
+                print(f"⚠️  SIGNAL CLIPPING: Vmax={vmax:.2f}V, Vmin={vmin:.2f}V")
+                print(f"    💡 Tip: Use voltage divider (2 resistors) to reduce signal to 0.5V-2.5V range")
+
         # Auto Trigger 50%
         if self.auto_trigger_50 and vpp > 0.5:
             self.last_vmax = vmax
@@ -395,7 +406,8 @@ class SPIReader:
             mid_level = (vmax + vmin) / 2.0
             if abs(mid_level - self.trigger_level) > 0.02:
                 self.trigger_level = mid_level
-                print(f"🎯 Auto 50%: {mid_level:.2f}V (Vmax={vmax:.2f}V, Vmin={vmin:.2f}V)")
+                clip_warn = " ⚠️ CLIPPED" if is_clipped else ""
+                print(f"🎯 Auto 50%: {mid_level:.2f}V (Vmax={vmax:.2f}V, Vmin={vmin:.2f}V){clip_warn}")
 
         # Find trigger edge
         edge_idx = self.find_trigger_edge(voltages)
@@ -420,7 +432,7 @@ class SPIReader:
             return voltages, times
 
     def calculate_frequency(self, voltages):
-        """Calculate frequency from zero crossings (with noise filtering)"""
+        """Calculate frequency from zero crossings (with ANTI-RINGING protection)"""
         if len(voltages) < 10:
             return 0.0
 
@@ -429,6 +441,9 @@ class SPIReader:
         vmin = min(voltages)
         vpp = vmax - vmin
         avg = sum(voltages) / len(voltages)
+
+        # Detect clipping (signal touches ADC limits)
+        is_clipped = (vmax >= 3.25) or (vmin <= 0.05)
 
         # Filter out noise: signal must have at least 300mV amplitude
         if vpp < 0.3:
@@ -440,15 +455,27 @@ class SPIReader:
                 print(f"📉 Freq: Signal too small (Vpp={vpp:.3f}V < 0.3V threshold)")
             return 0.0
 
-        # Hysteresis threshold: 10% of Vpp to avoid counting noise
-        threshold = vpp * 0.10  # 10% of peak-to-peak
+        # Hysteresis threshold: 15% of Vpp (increased from 10% to fight ringing)
+        threshold = vpp * 0.15
 
-        # Count zero crossings (rising edges only) with hysteresis
+        # ANTI-RINGING: Minimum samples between crossings
+        # Prevents counting edge oscillations (ringing) as multiple crossings
+        # With 411kHz sample rate:
+        #   - 100 samples = 0.24ms → allows detecting up to ~4kHz
+        #   - For 1kHz signal (period=1ms=411 samples), 100 samples = 24% of period
+        MIN_SAMPLES_BETWEEN_CROSSINGS = 100  # 0.24ms debounce
+
+        # Count zero crossings (rising edges only) with hysteresis + anti-ringing
         crossings = 0
+        last_crossing_index = -MIN_SAMPLES_BETWEEN_CROSSINGS  # Allow first detection
+
         for i in range(1, len(voltages)):
             # Must cross from below (avg - threshold) to above (avg + threshold)
             if voltages[i-1] < (avg - threshold) and voltages[i] >= (avg + threshold):
-                crossings += 1
+                # Check if enough samples passed since last crossing (anti-ringing)
+                if (i - last_crossing_index) >= MIN_SAMPLES_BETWEEN_CROSSINGS:
+                    crossings += 1
+                    last_crossing_index = i
 
         if crossings < 2:
             return 0.0
@@ -462,18 +489,34 @@ class SPIReader:
             self._freq_calc_count = 0
         self._freq_calc_count += 1
         if self._freq_calc_count % 50 == 0:  # Every 50 calculations
+            clip_warn = " ⚠️ CLIPPED" if is_clipped else ""
             print(f"🔍 Freq: {crossings} crossings in {total_time*1000:.1f}ms = {frequency:.1f}Hz "
-                  f"(Vpp={vpp:.2f}V, threshold={threshold:.3f}V, avg={avg:.2f}V)")
+                  f"(Vpp={vpp:.2f}V, Vmax={vmax:.2f}V, Vmin={vmin:.2f}V){clip_warn}")
 
         return frequency
 
     def find_trigger_edge(self, voltages):
-        """Find trigger edge in waveform with hysteresis"""
+        """Find trigger edge in waveform with ADAPTIVE hysteresis"""
         if len(voltages) < 10:
             return -1
 
         level = self.trigger_level
-        hysteresis = 0.05  # 50mV hysteresis to avoid noise
+
+        # ADAPTIVE HYSTERESIS: Scale with signal amplitude
+        # Calculate Vpp to detect clipping and adjust hysteresis
+        vmax = max(voltages)
+        vmin = min(voltages)
+        vpp = vmax - vmin
+        is_clipped = (vmax >= 3.25) or (vmin <= 0.05)
+
+        # Base hysteresis: 50mV for normal signals
+        # Increased hysteresis for clipped signals (more prone to ringing/noise)
+        if is_clipped:
+            # Clipped signal: Use larger hysteresis (5% of Vpp, min 100mV)
+            hysteresis = max(0.10, vpp * 0.05)
+        else:
+            # Normal signal: Use standard hysteresis (3% of Vpp, min 50mV)
+            hysteresis = max(0.05, vpp * 0.03)
 
         # Search for edge with hysteresis
         for i in range(1, len(voltages) - 1):
