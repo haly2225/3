@@ -43,8 +43,10 @@
 #include <fstream>
 
 // ============================================================================
-// Rotary Encoder EC11 - GPIO Control
+// Rotary Encoder EC11 - GPIO Control (libgpiod)
 // ============================================================================
+#include <gpiod.h>
+
 class RotaryEncoder {
 private:
     int gpio_clk = 17;   // Pin 11
@@ -53,6 +55,12 @@ private:
 
     std::atomic<bool> running{false};
     std::thread encoder_thread;
+
+    // libgpiod handles
+    struct gpiod_chip *chip = nullptr;
+    struct gpiod_line *line_clk = nullptr;
+    struct gpiod_line *line_dt = nullptr;
+    struct gpiod_line *line_sw = nullptr;
 
     // Encoder state
     int last_clk = 1;
@@ -64,59 +72,23 @@ private:
     std::function<void(int)> on_rotate;  // +1 for CW, -1 for CCW
     std::function<void()> on_button_press;
 
-    bool gpio_export(int pin) {
-        std::ofstream exp("/sys/class/gpio/export");
-        if (!exp.is_open()) {
-            std::cout << "❌ Encoder: Cannot open /sys/class/gpio/export (need sudo?)" << std::endl;
-            return false;
-        }
-        exp << pin;
-        if (exp.fail()) {
-            // Pin might already be exported
-            std::cout << "⚠️  Encoder: GPIO " << pin << " already exported (OK)" << std::endl;
-        } else {
-            std::cout << "✅ Encoder: GPIO " << pin << " exported" << std::endl;
-        }
-        exp.close();
-        usleep(100000); // Wait for GPIO to be ready
-        return true;
-    }
-
-    bool gpio_set_direction(int pin, const std::string& dir) {
-        std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/direction";
-        std::ofstream dirfile(path);
-        if (!dirfile.is_open()) {
-            std::cout << "❌ Encoder: Cannot set direction for GPIO " << pin << std::endl;
-            return false;
-        }
-        dirfile << dir;
-        dirfile.close();
-        std::cout << "✅ Encoder: GPIO " << pin << " direction set to " << dir << std::endl;
-        return true;
-    }
-
-    int gpio_read(int pin) {
-        std::string path = "/sys/class/gpio/gpio" + std::to_string(pin) + "/value";
-        std::ifstream valfile(path);
-        if (!valfile.is_open()) return -1;
-        int value;
-        valfile >> value;
-        valfile.close();
-        return value;
+    int gpio_read(struct gpiod_line *line) {
+        if (!line) return -1;
+        return gpiod_line_get_value(line);
     }
 
     void encoder_loop() {
         std::cout << "🔄 Encoder: Loop started" << std::endl;
 
         // Log initial GPIO values
-        int init_clk = gpio_read(gpio_clk);
-        int init_dt = gpio_read(gpio_dt);
-        int init_sw = gpio_read(gpio_sw);
+        int init_clk = gpio_read(line_clk);
+        int init_dt = gpio_read(line_dt);
+        int init_sw = gpio_read(line_sw);
         std::cout << "🔄 Encoder: Initial values - CLK=" << init_clk
                   << " DT=" << init_dt << " SW=" << init_sw << std::endl;
 
         if (init_clk < 0 || init_dt < 0 || init_sw < 0) {
-            std::cout << "❌ Encoder: GPIO read failed! Check permissions (need sudo?)" << std::endl;
+            std::cout << "❌ Encoder: GPIO read failed!" << std::endl;
             return;
         }
 
@@ -125,9 +97,9 @@ private:
             auto now = std::chrono::steady_clock::now();
 
             // Read current state
-            int clk = gpio_read(gpio_clk);
-            int dt = gpio_read(gpio_dt);
-            int sw = gpio_read(gpio_sw);
+            int clk = gpio_read(line_clk);
+            int dt = gpio_read(line_dt);
+            int sw = gpio_read(line_sw);
 
             // Debug: log first 5 reads and any changes
             if (loop_count < 5 || clk != last_clk || sw != last_sw) {
@@ -197,40 +169,52 @@ public:
 
     ~RotaryEncoder() {
         stop();
+
+        // Release GPIO lines
+        if (line_clk) gpiod_line_release(line_clk);
+        if (line_dt) gpiod_line_release(line_dt);
+        if (line_sw) gpiod_line_release(line_sw);
+
+        // Close chip
+        if (chip) gpiod_chip_close(chip);
     }
 
     bool init() {
-        std::cout << "🔧 Encoder: Initializing EC11 on GPIO 17, 27, 22..." << std::endl;
+        std::cout << "🔧 Encoder: Initializing EC11 using libgpiod..." << std::endl;
 
-        // Export GPIOs
-        if (!gpio_export(gpio_clk)) {
-            std::cout << "❌ Encoder: Init failed - cannot export GPIO" << std::endl;
+        // Open GPIO chip (gpiochip0 on Raspberry Pi)
+        chip = gpiod_chip_open_by_name("gpiochip0");
+        if (!chip) {
+            std::cout << "❌ Encoder: Failed to open gpiochip0" << std::endl;
             return false;
         }
-        if (!gpio_export(gpio_dt)) {
-            std::cout << "❌ Encoder: Init failed - cannot export GPIO" << std::endl;
-            return false;
-        }
-        if (!gpio_export(gpio_sw)) {
-            std::cout << "❌ Encoder: Init failed - cannot export GPIO" << std::endl;
-            return false;
-        }
+        std::cout << "✅ Encoder: Opened gpiochip0" << std::endl;
 
-        usleep(200000);
+        // Get GPIO lines
+        line_clk = gpiod_chip_get_line(chip, gpio_clk);
+        line_dt = gpiod_chip_get_line(chip, gpio_dt);
+        line_sw = gpiod_chip_get_line(chip, gpio_sw);
 
-        // Set as inputs
-        if (!gpio_set_direction(gpio_clk, "in")) {
-            std::cout << "❌ Encoder: Init failed - cannot set direction" << std::endl;
+        if (!line_clk || !line_dt || !line_sw) {
+            std::cout << "❌ Encoder: Failed to get GPIO lines" << std::endl;
             return false;
         }
-        if (!gpio_set_direction(gpio_dt, "in")) {
-            std::cout << "❌ Encoder: Init failed - cannot set direction" << std::endl;
+        std::cout << "✅ Encoder: Got GPIO lines 17, 27, 22" << std::endl;
+
+        // Request lines as inputs
+        if (gpiod_line_request_input(line_clk, "encoder_clk") < 0) {
+            std::cout << "❌ Encoder: Failed to request GPIO 17 (CLK) as input" << std::endl;
             return false;
         }
-        if (!gpio_set_direction(gpio_sw, "in")) {
-            std::cout << "❌ Encoder: Init failed - cannot set direction" << std::endl;
+        if (gpiod_line_request_input(line_dt, "encoder_dt") < 0) {
+            std::cout << "❌ Encoder: Failed to request GPIO 27 (DT) as input" << std::endl;
             return false;
         }
+        if (gpiod_line_request_input(line_sw, "encoder_sw") < 0) {
+            std::cout << "❌ Encoder: Failed to request GPIO 22 (SW) as input" << std::endl;
+            return false;
+        }
+        std::cout << "✅ Encoder: All GPIOs configured as inputs" << std::endl;
 
         std::cout << "✅ Encoder: Init OK!" << std::endl;
         return true;
