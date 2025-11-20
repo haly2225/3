@@ -46,12 +46,15 @@ from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 # Constants
 MARKER_START = 0xAA
 MARKER_HEADER = 0x55
-BUFFER_SIZE = 512
+BUFFER_SIZE = 2048  # Increased from 512 for full waveform display
+                     # At 411kHz sample rate with 1kHz signal:
+                     # - 1 cycle = 411 samples
+                     # - 2048 samples = 4.98 cycles (~5 full cycles)
 PACKET_SIZE = 4 + BUFFER_SIZE * 2
 SAMPLE_RATE = 411000.0  # Hz
 VCC = 3.3  # Volts
 ADC_MAX = 4095
-CAPTURE_SIZE = 512
+CAPTURE_SIZE = 2048  # Match BUFFER_SIZE
 
 class TriggerMode(Enum):
     AUTO = 0
@@ -455,15 +458,24 @@ class SPIReader:
                 print(f"📉 Freq: Signal too small (Vpp={vpp:.3f}V < 0.3V threshold)")
             return 0.0
 
-        # Hysteresis threshold: 15% of Vpp (increased from 10% to fight ringing)
-        threshold = vpp * 0.15
+        # ADAPTIVE parameters based on clipping detection
+        if is_clipped:
+            # Clipped signals have severe ringing: use larger threshold and debounce
+            threshold = vpp * 0.20  # 20% hysteresis
+            # Longer debounce for clipped signals (up to ~1kHz max frequency)
+            MIN_SAMPLES_BETWEEN_CROSSINGS = 200  # 0.487ms debounce
+        else:
+            # Normal signals: standard parameters
+            threshold = vpp * 0.15  # 15% hysteresis
+            MIN_SAMPLES_BETWEEN_CROSSINGS = 100  # 0.243ms debounce
 
         # ANTI-RINGING: Minimum samples between crossings
         # Prevents counting edge oscillations (ringing) as multiple crossings
         # With 411kHz sample rate:
-        #   - 100 samples = 0.24ms → allows detecting up to ~4kHz
-        #   - For 1kHz signal (period=1ms=411 samples), 100 samples = 24% of period
-        MIN_SAMPLES_BETWEEN_CROSSINGS = 100  # 0.24ms debounce
+        #   - 100 samples = 0.243ms → allows up to ~2kHz (normal signals)
+        #   - 200 samples = 0.487ms → allows up to ~1kHz (clipped signals)
+        # For 1kHz signal: period = 1ms = 411 samples
+        #   - 200 sample debounce = 49% of period (skips all ringing)
 
         # Count zero crossings (rising edges only) with hysteresis + anti-ringing
         crossings = 0
@@ -496,8 +508,8 @@ class SPIReader:
         return frequency
 
     def find_trigger_edge(self, voltages):
-        """Find trigger edge in waveform with ADAPTIVE hysteresis"""
-        if len(voltages) < 10:
+        """Find trigger edge with ENHANCED stability for clipped signals"""
+        if len(voltages) < 20:
             return -1
 
         level = self.trigger_level
@@ -509,27 +521,65 @@ class SPIReader:
         vpp = vmax - vmin
         is_clipped = (vmax >= 3.25) or (vmin <= 0.05)
 
-        # Base hysteresis: 50mV for normal signals
-        # Increased hysteresis for clipped signals (more prone to ringing/noise)
+        # Enhanced hysteresis for clipped signals
         if is_clipped:
-            # Clipped signal: Use larger hysteresis (5% of Vpp, min 100mV)
-            hysteresis = max(0.10, vpp * 0.05)
+            # Clipped signal: Use much larger hysteresis (10% of Vpp, min 150mV)
+            # This helps skip ringing/noise at clipped edges
+            hysteresis = max(0.15, vpp * 0.10)
+            # For clipped signals, require stable LOW state before accepting trigger
+            min_stable_samples = 20  # ~0.05ms at 411kHz
         else:
             # Normal signal: Use standard hysteresis (3% of Vpp, min 50mV)
             hysteresis = max(0.05, vpp * 0.03)
+            min_stable_samples = 5
 
-        # Search for edge with hysteresis
-        for i in range(1, len(voltages) - 1):
+        # STATE MACHINE approach for more stable trigger
+        # Must be in LOW/HIGH state for min_stable_samples before accepting edge
+        in_low_state = False
+        low_state_count = 0
+        in_high_state = False
+        high_state_count = 0
+
+        for i in range(len(voltages)):
+            v = voltages[i]
+
             if self.trigger_slope == TriggerSlope.RISING:
-                # Rising edge with hysteresis:
-                # Must go below (level - hysteresis) then cross level
-                if voltages[i-1] < (level - hysteresis) and voltages[i] >= level:
-                    return i
+                # Check if in LOW state (below level - hysteresis)
+                if v < (level - hysteresis):
+                    if not in_low_state:
+                        in_low_state = True
+                        low_state_count = 1
+                    else:
+                        low_state_count += 1
+                    in_high_state = False
+                    high_state_count = 0
+                # Check if crossing to HIGH (above level)
+                elif v >= level:
+                    if in_low_state and low_state_count >= min_stable_samples:
+                        # Valid rising edge: was LOW long enough, now crossing HIGH
+                        return i
+                    # Reset if we see HIGH without stable LOW first
+                    in_low_state = False
+                    low_state_count = 0
             else:
-                # Falling edge with hysteresis:
-                # Must go above (level + hysteresis) then cross level
-                if voltages[i-1] > (level + hysteresis) and voltages[i] <= level:
-                    return i
+                # FALLING edge detection
+                # Check if in HIGH state (above level + hysteresis)
+                if v > (level + hysteresis):
+                    if not in_high_state:
+                        in_high_state = True
+                        high_state_count = 1
+                    else:
+                        high_state_count += 1
+                    in_low_state = False
+                    low_state_count = 0
+                # Check if crossing to LOW (below level)
+                elif v <= level:
+                    if in_high_state and high_state_count >= min_stable_samples:
+                        # Valid falling edge: was HIGH long enough, now crossing LOW
+                        return i
+                    # Reset if we see LOW without stable HIGH first
+                    in_high_state = False
+                    high_state_count = 0
 
         return -1
 
