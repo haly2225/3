@@ -98,6 +98,11 @@ int main(void)
 
     if (buffer_ready) {
       buffer_ready = 0;
+
+      // Send data via SPI DMA
+      HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
+
+      // Restart ADC for next capture
       HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, BUFFER_SIZE);
     }
   }

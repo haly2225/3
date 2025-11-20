@@ -536,27 +536,57 @@ private:
     }
     
     bool parse_packet(const std::vector<uint8_t>& buf) {
-        // Find marker
+        // Find marker - scan entire buffer for 0xAA 0x55
         int marker_pos = -1;
-        for (size_t i = 0; i <= buf.size() - PACKET_SIZE; i++) {
+        static int scan_count = 0;
+
+        for (size_t i = 0; i < buf.size() - 1; i++) {
             if (buf[i] == MARKER_START && buf[i+1] == MARKER_HEADER) {
                 marker_pos = i;
+
+                // Log first marker found
+                static bool first_marker_logged = false;
+                if (!first_marker_logged) {
+                    first_marker_logged = true;
+                    std::ostringstream oss;
+                    oss << "✅ Found marker 0xAA 0x55 at position " << i
+                        << " (need " << PACKET_SIZE << " bytes total)";
+                    logger.log(oss.str());
+                }
                 break;
             }
         }
 
         if (marker_pos < 0) {
-            // Debug: check if all zeros (no data from STM32)
-            static int all_zero_count = 0;
-            bool all_zero = true;
-            for (size_t i = 0; i < buf.size() && i < 100; i++) {
-                if (buf[i] != 0x00) {
-                    all_zero = false;
-                    break;
+            // Debug: scan for any 0xAA in buffer
+            if (scan_count++ < 5) {
+                bool has_aa = false;
+                for (size_t i = 0; i < buf.size(); i++) {
+                    if (buf[i] == 0xAA) {
+                        has_aa = true;
+                        std::ostringstream oss;
+                        oss << "🔍 Found 0xAA at position " << i
+                            << ", next byte: 0x" << std::hex << (int)buf[i+1];
+                        logger.log(oss.str());
+                        break;
+                    }
+                }
+                if (!has_aa) {
+                    logger.log("⚠️  No 0xAA marker found in packet - STM32 may not be transmitting");
                 }
             }
-            if (all_zero && all_zero_count++ < 2) {
-                logger.log("⚠️  SPI reads all 0x00 - STM32 not sending data or not connected");
+            return false;
+        }
+
+        // Check if we have enough bytes after marker
+        if (marker_pos + PACKET_SIZE > (int)buf.size()) {
+            static int incomplete_count = 0;
+            if (incomplete_count++ < 3) {
+                std::ostringstream oss;
+                oss << "⚠️  Marker found at " << marker_pos
+                    << " but only " << (buf.size() - marker_pos)
+                    << " bytes remaining (need " << PACKET_SIZE << ")";
+                logger.log(oss.str());
             }
             return false;
         }
