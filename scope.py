@@ -10,7 +10,7 @@ Features:
 - Auto Trigger 50%
 
 Install dependencies:
-    sudo apt-get install -y python3-pyqt5 python3-spidev python3-gpiod
+    sudo apt-get install -y python3-pyqt5 python3-spidev python3-rpi.gpio
 
 Run:
     python3 scope.py
@@ -32,10 +32,10 @@ except ImportError:
     spidev = None
 
 try:
-    import gpiod
+    import RPi.GPIO as GPIO
 except ImportError:
-    print("⚠️  Warning: gpiod not available (encoder will not work)")
-    gpiod = None
+    print("⚠️  Warning: RPi.GPIO not available (encoder will not work)")
+    GPIO = None
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                               QPushButton, QLabel, QButtonGroup, QRadioButton,
@@ -63,18 +63,13 @@ class TriggerSlope(Enum):
     FALLING = 1
 
 # ============================================================================
-# Rotary Encoder EC11 - GPIO Control (gpiod Python)
+# Rotary Encoder EC11 - GPIO Control (RPi.GPIO)
 # ============================================================================
 class RotaryEncoder:
     def __init__(self):
         self.gpio_clk = 17  # Pin 11
         self.gpio_dt = 27   # Pin 13
         self.gpio_sw = 22   # Pin 15
-
-        self.chip = None
-        self.line_clk = None
-        self.line_dt = None
-        self.line_sw = None
 
         self.running = False
         self.thread = None
@@ -88,67 +83,48 @@ class RotaryEncoder:
         self.on_button_press = None
 
     def init(self):
-        """Initialize GPIO using gpiod Python bindings"""
-        if gpiod is None:
-            print("❌ Encoder: gpiod not available")
+        """Initialize GPIO using RPi.GPIO"""
+        if GPIO is None:
+            print("❌ Encoder: RPi.GPIO not available")
             return False
 
         try:
-            print("🔧 Encoder: Initializing EC11 using gpiod...")
+            print("🔧 Encoder: Initializing EC11 using RPi.GPIO...")
 
-            # Open GPIO chip
-            self.chip = gpiod.Chip('gpiochip0')
-            print("✅ Encoder: Opened gpiochip0")
+            # Setup GPIO mode
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
 
-            # Get GPIO lines
-            self.line_clk = self.chip.get_line(self.gpio_clk)
-            self.line_dt = self.chip.get_line(self.gpio_dt)
-            self.line_sw = self.chip.get_line(self.gpio_sw)
-            print("✅ Encoder: Got GPIO lines 17, 27, 22")
+            # Setup pins as inputs with pull-up resistors
+            GPIO.setup(self.gpio_clk, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(self.gpio_dt, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(self.gpio_sw, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-            # Request lines as inputs
-            self.line_clk.request(consumer="encoder_clk", type=gpiod.LINE_REQ_DIR_IN)
-            self.line_dt.request(consumer="encoder_dt", type=gpiod.LINE_REQ_DIR_IN)
-            self.line_sw.request(consumer="encoder_sw", type=gpiod.LINE_REQ_DIR_IN)
-            print("✅ Encoder: All GPIOs configured as inputs")
-
+            print("✅ Encoder: GPIO 17, 27, 22 configured as inputs with pull-up")
             print("✅ Encoder: Init OK!")
             return True
         except Exception as e:
             print(f"❌ Encoder: Init failed - {e}")
             return False
 
-    def gpio_read(self, line):
-        """Read GPIO value"""
-        if line is None:
-            return -1
-        try:
-            return line.get_value()
-        except:
-            return -1
-
     def encoder_loop(self):
         """Main encoder polling loop"""
         print("🔄 Encoder: Loop started")
 
         # Log initial values
-        init_clk = self.gpio_read(self.line_clk)
-        init_dt = self.gpio_read(self.line_dt)
-        init_sw = self.gpio_read(self.line_sw)
+        init_clk = GPIO.input(self.gpio_clk)
+        init_dt = GPIO.input(self.gpio_dt)
+        init_sw = GPIO.input(self.gpio_sw)
         print(f"🔄 Encoder: Initial values - CLK={init_clk} DT={init_dt} SW={init_sw}")
-
-        if init_clk < 0 or init_dt < 0 or init_sw < 0:
-            print("❌ Encoder: GPIO read failed!")
-            return
 
         loop_count = 0
         while self.running:
             now = time.time()
 
             # Read current state
-            clk = self.gpio_read(self.line_clk)
-            dt = self.gpio_read(self.line_dt)
-            sw = self.gpio_read(self.line_sw)
+            clk = GPIO.input(self.gpio_clk)
+            dt = GPIO.input(self.gpio_dt)
+            sw = GPIO.input(self.gpio_sw)
 
             # Debug first 5 reads
             if loop_count < 5:
@@ -183,7 +159,7 @@ class RotaryEncoder:
             self.last_sw = sw
 
             loop_count += 1
-            time.sleep(0.001)  # Poll every 1ms
+            time.sleep(0.01)  # Poll every 10ms
 
         print("🔄 Encoder: Loop stopped")
 
@@ -199,29 +175,11 @@ class RotaryEncoder:
         if self.thread:
             self.thread.join(timeout=1.0)
 
-        # Release GPIO lines
-        if self.line_clk:
-            try:
-                self.line_clk.release()
-            except:
-                pass
-        if self.line_dt:
-            try:
-                self.line_dt.release()
-            except:
-                pass
-        if self.line_sw:
-            try:
-                self.line_sw.release()
-            except:
-                pass
-
-        # Close chip
-        if self.chip:
-            try:
-                self.chip.close()
-            except:
-                pass
+        # Cleanup GPIO
+        try:
+            GPIO.cleanup([self.gpio_clk, self.gpio_dt, self.gpio_sw])
+        except:
+            pass
 
     def set_rotation_callback(self, callback):
         """Set rotation callback function"""

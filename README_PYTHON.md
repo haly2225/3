@@ -16,7 +16,7 @@ Phiên bản Python của oscilloscope chuyên nghiệp, dễ cài đặt và ch
 ```bash
 # 1. Install dependencies
 sudo apt-get update
-sudo apt-get install -y python3-pyqt5 python3-spidev python3-gpiod
+sudo apt-get install -y python3-pyqt5 python3-spidev python3-rpi.gpio
 
 # 2. Enable SPI
 sudo raspi-config
@@ -30,10 +30,10 @@ sudo reboot
 
 ```bash
 cd ~/3
-python3 scope.py
+sudo python3 scope.py
 ```
 
-**Không cần sudo!** Python gpiod không cần quyền root.
+**Cần sudo!** RPi.GPIO cần quyền root để access GPIO.
 
 ## Sử dụng
 
@@ -77,9 +77,9 @@ sudo apt-get install -y python3-pyqt5
 sudo apt-get install -y python3-spidev
 ```
 
-### Lỗi: "ImportError: No module named 'gpiod'"
+### Lỗi: "ImportError: No module named 'RPi.GPIO'" hoặc "ImportError: No module named 'RPi'"
 ```bash
-sudo apt-get install -y python3-gpiod
+sudo apt-get install -y python3-rpi.gpio
 ```
 
 ### Test Encoder Hardware
@@ -96,9 +96,9 @@ watch -n 0.1 'gpioget gpiochip0 17 27 22'
 | Feature | C++ (ol.cpp) | Python (scope.py) |
 |---------|-------------|------------------|
 | Compile | ✗ Cần g++, Qt5 headers | ✅ Không cần compile |
-| Dependencies | libgpiod-dev, Qt5 | python3-gpiod, PyQt5 |
-| Permissions | Cần sudo | ✅ Không cần sudo |
-| libgpiod API | v1.x (deprecated) | ✅ Python bindings (modern) |
+| Dependencies | libgpiod-dev, Qt5 | RPi.GPIO, PyQt5 |
+| Permissions | Cần sudo | ✅ Cần sudo cho GPIO |
+| GPIO API | libgpiod v1.x (lỗi) | ✅ RPi.GPIO (stable) |
 | Performance | Nhanh hơn | ✅ Đủ nhanh (20 FPS) |
 | Dễ maintain | Phức tạp | ✅ Dễ đọc, dễ sửa |
 
@@ -109,7 +109,29 @@ watch -n 0.1 'gpioget gpiochip0 17 27 22'
 Phù hợp cho:
 - ✅ Development và testing
 - ✅ Học tập và demo
-- ✅ Raspberry Pi OS mới (không support libgpiod v1.x C API)
+- ✅ Tất cả Raspberry Pi OS (RPi.GPIO stable và được hỗ trợ tốt)
 
-Nếu cần performance tối đa → dùng C++ version
-Nếu cần dễ dùng và không lỗi → **dùng Python version** 🎉
+Nếu cần performance tối đa → dùng C++ version (nhưng cần fix libgpiod)
+Nếu cần dễ dùng và chạy ngay → **dùng Python version** 🎉
+
+## Encoder hoạt động như thế nào?
+
+### Xoay CW (Clockwise - Xoay phải):
+1. CLK chuyển từ 1→0 (falling edge)
+2. Tại thời điểm CLK=0, kiểm tra DT
+3. Nếu DT=0 → Direction = +1 (CW)
+4. Callback `on_rotate(+1)` được gọi
+5. Time/Div hoặc Volts/Div tăng lên
+
+### Xoay CCW (Counter-Clockwise - Xoay trái):
+1. CLK chuyển từ 1→0 (falling edge)
+2. Tại thời điểm CLK=0, kiểm tra DT
+3. Nếu DT=1 → Direction = -1 (CCW)
+4. Callback `on_rotate(-1)` được gọi
+5. Time/Div hoặc Volts/Div giảm xuống
+
+### Nhấn nút:
+1. SW chuyển từ 1→0 (falling edge)
+2. Debounce 200ms để tránh nhiễu
+3. Callback `on_button_press()` được gọi
+4. Chuyển đổi giữa Time/Div mode ↔ Volts/Div mode
