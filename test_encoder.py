@@ -52,7 +52,9 @@ try:
 
             # Debounce (> 5ms)
             if elapsed > 5:
-                direction = "CW ➡️ " if dt == 0 else "CCW ⬅️"
+                # FIXED: CW (clockwise) = DT is HIGH (1) at falling edge
+                # CCW (counter-clockwise) = DT is LOW (0) at falling edge
+                direction = "CW ⬆️  (tăng)" if dt == 1 else "CCW ⬇️  (giảm)"
                 rotation_count += 1
                 print(f"🎯 ROTATION #{rotation_count}: {direction} (DT={dt}, {elapsed:.1f}ms)")
                 last_rotation_time = now

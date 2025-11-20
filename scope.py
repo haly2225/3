@@ -133,12 +133,17 @@ class RotaryEncoder:
             # Detect rotation (CLK falling edge)
             if clk == 0 and self.last_clk == 1:
                 elapsed = (now - self.last_rotation_time) * 1000
-                print(f"🔄 Encoder: CLK falling edge! DT={dt} elapsed={elapsed:.1f}ms")
+
+                # Debug
+                if loop_count < 10 or elapsed > 5:
+                    print(f"🔄 Encoder: CLK falling edge! DT={dt} elapsed={elapsed:.1f}ms")
 
                 # Debounce (> 5ms)
                 if elapsed > 5:
-                    direction = 1 if dt == 0 else -1
-                    print(f"🎯 Encoder: ROTATION {'CW' if direction > 0 else 'CCW'}")
+                    # FIXED: CW (clockwise) = DT is HIGH (1) at falling edge
+                    # CCW (counter-clockwise) = DT is LOW (0) at falling edge
+                    direction = 1 if dt == 1 else -1
+                    print(f"🎯 Encoder: ROTATION {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt})")
                     if self.on_rotate:
                         self.on_rotate(direction)
                     self.last_rotation_time = now
@@ -579,23 +584,31 @@ class MainWindow(QWidget):
 
         # Encoder mode
         self.encoder_mode_volts = False
-        self.time_scale_index = 3  # Default: 1ms
-        self.volt_scale_index = 1  # Default: 0.5V
+        self.time_scale_index = 4  # Default: 1ms (index 4 in new array)
+        self.volt_scale_index = 3  # Default: 0.5V (index 3 in new array)
 
         self.time_scales = [
+            ("50µs", 0.00005),
             ("100µs", 0.0001),
             ("200µs", 0.0002),
             ("500µs", 0.0005),
             ("1ms", 0.001),
             ("2ms", 0.002),
-            ("5ms", 0.005)
+            ("5ms", 0.005),
+            ("10ms", 0.010),
+            ("20ms", 0.020),
+            ("50ms", 0.050),
+            ("100ms", 0.100)
         ]
 
         self.volt_scales = [
+            ("0.05V", 0.05),
+            ("0.1V", 0.1),
             ("0.2V", 0.2),
             ("0.5V", 0.5),
             ("1V", 1.0),
-            ("2V", 2.0)
+            ("2V", 2.0),
+            ("5V", 5.0)
         ]
 
         # Setup UI
