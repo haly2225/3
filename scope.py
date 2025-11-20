@@ -82,6 +82,11 @@ class RotaryEncoder:
         self.on_rotate = None
         self.on_button_press = None
 
+        # Debug stats
+        self.rotation_count = 0
+        self.button_count = 0
+        self.last_direction = 0  # 1=CW, -1=CCW
+
     def init(self):
         """Initialize GPIO using RPi.GPIO"""
         if GPIO is None:
@@ -143,7 +148,9 @@ class RotaryEncoder:
                     # FIXED: CW (clockwise) = DT is HIGH (1) at falling edge
                     # CCW (counter-clockwise) = DT is LOW (0) at falling edge
                     direction = 1 if dt == 1 else -1
-                    print(f"🎯 Encoder: ROTATION {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt})")
+                    self.rotation_count += 1
+                    self.last_direction = direction
+                    print(f"🎯 Encoder: ROTATION #{self.rotation_count} {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt})")
                     if self.on_rotate:
                         self.on_rotate(direction)
                     self.last_rotation_time = now
@@ -155,7 +162,8 @@ class RotaryEncoder:
 
                 # Debounce (> 200ms)
                 if elapsed > 200:
-                    print("🎯 Encoder: BUTTON PRESSED")
+                    self.button_count += 1
+                    print(f"🎯 Encoder: BUTTON PRESSED #{self.button_count}")
                     if self.on_button_press:
                         self.on_button_press()
                     self.last_button_time = now
@@ -222,6 +230,15 @@ class SPIReader:
         self.edge_index = 100  # Target edge position
         self.shift_samples = 0.0
 
+        # Debug stats
+        self.packet_count = 0
+        self.sync_ok_count = 0
+        self.trigger_found_count = 0
+        self.vpp_latest = 0.0
+        self.vmax_latest = 0.0
+        self.vmin_latest = 0.0
+        self.frequency_latest = 0.0
+
     def init(self, device="/dev/spidev0.0", speed=16000000):
         """Initialize SPI"""
         if spidev is None:
@@ -248,11 +265,14 @@ class SPIReader:
         try:
             # Read packet
             data = self.spi.readbytes(PACKET_SIZE)
+            self.packet_count += 1
 
             # Find marker
             for i in range(len(data) - 3):
                 if data[i] == MARKER_START and data[i+1] == MARKER_HEADER:
                     # Found marker
+                    self.sync_ok_count += 1
+
                     payload = data[i+4:i+4+BUFFER_SIZE*2]
                     if len(payload) == BUFFER_SIZE * 2:
                         # Decode ADC values
@@ -281,6 +301,14 @@ class SPIReader:
         vmin = min(voltages)
         vpp = vmax - vmin
 
+        # Update debug stats
+        self.vmax_latest = vmax
+        self.vmin_latest = vmin
+        self.vpp_latest = vpp
+
+        # Calculate frequency (count zero crossings)
+        self.frequency_latest = self.calculate_frequency(voltages)
+
         # Auto Trigger 50%
         if self.auto_trigger_50 and vpp > 0.5:
             self.last_vmax = vmax
@@ -294,6 +322,8 @@ class SPIReader:
         edge_idx = self.find_trigger_edge(voltages)
 
         if edge_idx >= 0:
+            self.trigger_found_count += 1
+
             # Phase-locked alignment
             shift = self.edge_index - edge_idx
             self.shift_samples = shift
@@ -309,6 +339,29 @@ class SPIReader:
             # No trigger found (free run)
             times = [i / SAMPLE_RATE for i in range(len(voltages))]
             return voltages, times
+
+    def calculate_frequency(self, voltages):
+        """Calculate frequency from zero crossings"""
+        if len(voltages) < 10:
+            return 0.0
+
+        # Find average (mid-level)
+        avg = sum(voltages) / len(voltages)
+
+        # Count zero crossings (rising edges only)
+        crossings = 0
+        for i in range(1, len(voltages)):
+            if voltages[i-1] < avg and voltages[i] >= avg:
+                crossings += 1
+
+        if crossings < 2:
+            return 0.0
+
+        # Calculate period and frequency
+        total_time = len(voltages) / SAMPLE_RATE
+        frequency = crossings / total_time
+
+        return frequency
 
     def find_trigger_edge(self, voltages):
         """Find trigger edge in waveform"""
@@ -685,6 +738,27 @@ class MainWindow(QWidget):
         self.auto_50_btn.clicked.connect(self.toggle_auto_50)
         panel_layout.addWidget(self.auto_50_btn)
 
+        # Debug Section
+        panel_layout.addSpacing(20)
+        debug_title = QLabel("━━━ DEBUG INFO ━━━")
+        debug_title.setStyleSheet("color: #666; font-size: 12px; font-weight: bold;")
+        panel_layout.addWidget(debug_title)
+
+        # Signal measurements
+        self.debug_signal = QLabel("Signal:\nVpp: 0.00V\nFreq: 0 Hz")
+        self.debug_signal.setStyleSheet("color: #0f0; font-size: 9px; font-family: monospace;")
+        panel_layout.addWidget(self.debug_signal)
+
+        # SPI stats
+        self.debug_spi = QLabel("SPI:\nPackets: 0\nSync: 0%")
+        self.debug_spi.setStyleSheet("color: #0ff; font-size: 9px; font-family: monospace;")
+        panel_layout.addWidget(self.debug_spi)
+
+        # Encoder stats
+        self.debug_encoder = QLabel("Encoder:\nRotations: 0\nButtons: 0\nMode: TIME/DIV")
+        self.debug_encoder.setStyleSheet("color: #ff0; font-size: 9px; font-family: monospace;")
+        panel_layout.addWidget(self.debug_encoder)
+
         # Spacer
         panel_layout.addStretch()
 
@@ -699,6 +773,9 @@ class MainWindow(QWidget):
         """Update display with new data"""
         voltages, times = self.reader.get_data()
         self.display.set_data(voltages, times)
+
+        # Update debug info
+        self.update_debug_info()
 
     def change_trigger_mode(self, mode_id):
         """Change trigger mode"""
@@ -740,6 +817,43 @@ class MainWindow(QWidget):
         mode_str = "VOLTS/DIV" if self.encoder_mode_volts else "TIME/DIV"
         print(f"🎛️  Mode: {mode_str}")
         self.info_label.setText(f"Encoder Mode:\n{mode_str}")
+
+    def update_debug_info(self):
+        """Update debug information labels"""
+        # Signal measurements
+        vpp = self.reader.vpp_latest
+        vmax = self.reader.vmax_latest
+        vmin = self.reader.vmin_latest
+        freq = self.reader.frequency_latest
+
+        # Format frequency
+        if freq >= 1000000:
+            freq_str = f"{freq/1000000:.2f} MHz"
+        elif freq >= 1000:
+            freq_str = f"{freq/1000:.2f} kHz"
+        else:
+            freq_str = f"{freq:.1f} Hz"
+
+        signal_text = f"Signal:\nVpp: {vpp:.2f}V\nVmax: {vmax:.2f}V\nVmin: {vmin:.2f}V\nFreq: {freq_str}"
+        self.debug_signal.setText(signal_text)
+
+        # SPI stats
+        packets = self.reader.packet_count
+        sync_ok = self.reader.sync_ok_count
+        sync_rate = (sync_ok / packets * 100) if packets > 0 else 0
+        trigger_found = self.reader.trigger_found_count
+
+        spi_text = f"SPI:\nPackets: {packets}\nSync: {sync_rate:.1f}%\nTriggers: {trigger_found}"
+        self.debug_spi.setText(spi_text)
+
+        # Encoder stats
+        rotations = self.encoder.rotation_count
+        buttons = self.encoder.button_count
+        mode_str = "VOLTS/DIV" if self.encoder_mode_volts else "TIME/DIV"
+        last_dir = "CW⬆️" if self.encoder.last_direction > 0 else ("CCW⬇️" if self.encoder.last_direction < 0 else "---")
+
+        encoder_text = f"Encoder:\nRotations: {rotations} {last_dir}\nButtons: {buttons}\nMode: {mode_str}"
+        self.debug_encoder.setText(encoder_text)
 
     def keyPressEvent(self, event):
         """Handle keyboard input"""
