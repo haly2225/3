@@ -1156,8 +1156,17 @@ class MainWindow(QWidget):
 
     def update_display(self):
         """Update display with new data"""
-        # Use memory buffer with scroll support
-        voltages, times = self.reader.get_data_from_memory(num_samples=DISPLAY_SAMPLES)
+        # Check if we're in live view or scroll/pause mode
+        mem_info = self.reader.get_memory_info()
+
+        if mem_info['is_live']:
+            # LIVE MODE: Use single packet (512 samples) to avoid stitching artifacts
+            # No data gaps between samples in a single packet
+            voltages, times = self.reader.get_data()
+        else:
+            # SCROLL/PAUSE MODE: Use memory buffer for history viewing
+            # May have stitching artifacts at packet boundaries (every 512 samples)
+            voltages, times = self.reader.get_data_from_memory(num_samples=DISPLAY_SAMPLES)
 
         if len(voltages) > 0:
             self.display.set_data(voltages, times)
