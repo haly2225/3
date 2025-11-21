@@ -303,10 +303,24 @@ class SPIReader:
         self.last_vmax = 3.3
         self.last_vmin = 0.0
 
-        # Data buffers
+        # Data buffers (current packet - for display)
         self.voltage_buffer = []
         self.time_buffer = []
         self.lock = threading.Lock()
+
+        # =====================================================
+        # DEEP MEMORY BUFFER - Ring Buffer for scroll history
+        # =====================================================
+        # Stores 100,000 samples (~243ms at 411kHz)
+        # - 1kHz signal: ~243 cycles stored
+        # - 100Hz signal: ~24 cycles stored
+        self.memory = deque(maxlen=100000)
+        self.memory_times = deque(maxlen=100000)
+        self.memory_sample_count = 0  # Total samples received
+
+        # Scroll/Pause control
+        self.scroll_offset = 0  # 0 = live view, >0 = viewing history
+        self.is_paused = False  # Pause data collection
 
         # Phase-lock state
         self.edge_index = 100  # Target edge position
@@ -608,13 +622,32 @@ class SPIReader:
         last_debug_time = time.time()
 
         while self.running:
+            # Check if paused - skip reading if paused
+            if self.is_paused:
+                time.sleep(0.01)  # Sleep longer when paused
+                continue
+
             samples = self.read_packet()
             if samples:
                 voltages, times = self.parse_packet(samples)
 
                 with self.lock:
+                    # Store for live display
                     self.voltage_buffer = voltages
                     self.time_buffer = times
+
+                    # =====================================================
+                    # DEEP MEMORY: Extend into ring buffer
+                    # =====================================================
+                    # Add new samples to memory (oldest will auto-drop)
+                    self.memory.extend(voltages)
+
+                    # Track time for each sample (absolute time)
+                    base_time = self.memory_sample_count / SAMPLE_RATE
+                    for i in range(len(voltages)):
+                        self.memory_times.append(base_time + i / SAMPLE_RATE)
+
+                    self.memory_sample_count += len(voltages)
 
                 loop_count += 1
 
@@ -622,9 +655,12 @@ class SPIReader:
                 now = time.time()
                 if now - last_debug_time >= 5.0:
                     sync_rate = 100.0 * self.sync_ok_count / max(1, self.packet_count)
+                    mem_size = len(self.memory)
+                    mem_time = mem_size / SAMPLE_RATE * 1000  # ms
                     print(f"📊 SPI Stats: Packets={self.packet_count}, Sync={sync_rate:.1f}%, "
                           f"Triggers={self.trigger_found_count}, Loops={loop_count}")
                     print(f"📈 Signal: Vpp={self.vpp_latest:.2f}V, Freq={self.frequency_latest:.1f}Hz")
+                    print(f"💾 Memory: {mem_size} samples ({mem_time:.1f}ms), Offset={self.scroll_offset}")
                     last_debug_time = now
             else:
                 time.sleep(0.001)
@@ -650,6 +686,113 @@ class SPIReader:
         """Get latest waveform data"""
         with self.lock:
             return self.voltage_buffer.copy(), self.time_buffer.copy()
+
+    # =====================================================
+    # DEEP MEMORY: Scroll/Pause/History Methods
+    # =====================================================
+
+    def get_data_from_memory(self, num_samples=2048):
+        """Get data from memory buffer with scroll offset
+
+        Args:
+            num_samples: Number of samples to retrieve
+
+        Returns:
+            (voltages, times) tuple from memory
+
+        When scroll_offset = 0: Returns most recent data (live view)
+        When scroll_offset > 0: Returns historical data
+        """
+        with self.lock:
+            mem_len = len(self.memory)
+
+            if mem_len == 0:
+                return [], []
+
+            # Calculate start and end indices
+            # offset=0 means live view (end of buffer)
+            end_idx = mem_len - self.scroll_offset
+            start_idx = end_idx - num_samples
+
+            # Clamp to valid range
+            if end_idx > mem_len:
+                end_idx = mem_len
+            if start_idx < 0:
+                start_idx = 0
+            if end_idx < 0:
+                end_idx = 0
+
+            if start_idx >= end_idx:
+                return [], []
+
+            # Extract slice from deque (convert to list first)
+            mem_list = list(self.memory)
+            voltages = mem_list[start_idx:end_idx]
+
+            # Generate relative time array
+            times = [i / SAMPLE_RATE for i in range(len(voltages))]
+
+            return voltages, times
+
+    def toggle_pause(self):
+        """Toggle pause state"""
+        self.is_paused = not self.is_paused
+        state = "PAUSED ⏸️" if self.is_paused else "LIVE ▶️"
+        print(f"📹 {state}")
+
+        # When resuming, reset scroll offset to live view
+        if not self.is_paused:
+            self.scroll_offset = 0
+
+        return self.is_paused
+
+    def scroll(self, amount):
+        """Scroll through memory history
+
+        Args:
+            amount: Positive = scroll back (older), Negative = scroll forward (newer)
+        """
+        if not self.is_paused:
+            # Auto-pause when scrolling
+            self.is_paused = True
+            print("📹 Auto-PAUSED for scrolling")
+
+        # Calculate new offset
+        new_offset = self.scroll_offset + amount
+
+        # Clamp to valid range
+        max_offset = max(0, len(self.memory) - 2048)  # Leave room for display
+        if new_offset < 0:
+            new_offset = 0
+        if new_offset > max_offset:
+            new_offset = max_offset
+
+        self.scroll_offset = new_offset
+
+        # Calculate time position
+        if len(self.memory) > 0:
+            time_pos = self.scroll_offset / SAMPLE_RATE * 1000  # ms from live
+            print(f"⏪ Scroll: -{time_pos:.1f}ms from live (offset={self.scroll_offset})")
+
+    def go_to_live(self):
+        """Return to live view"""
+        self.scroll_offset = 0
+        self.is_paused = False
+        print("📹 LIVE ▶️ (scroll reset)")
+
+    def get_memory_info(self):
+        """Get memory buffer information"""
+        mem_len = len(self.memory)
+        mem_time_ms = mem_len / SAMPLE_RATE * 1000
+        offset_time_ms = self.scroll_offset / SAMPLE_RATE * 1000
+        return {
+            'samples': mem_len,
+            'time_ms': mem_time_ms,
+            'offset': self.scroll_offset,
+            'offset_time_ms': offset_time_ms,
+            'is_paused': self.is_paused,
+            'is_live': self.scroll_offset == 0 and not self.is_paused
+        }
 
     def set_trigger_mode(self, mode):
         """Set trigger mode"""
@@ -877,10 +1020,12 @@ class MainWindow(QWidget):
         self.encoder = RotaryEncoder()
         self.display = ScopeDisplay()
 
-        # Encoder mode
-        self.encoder_mode_volts = False
+        # Encoder mode: 0=TIME/DIV, 1=VOLTS/DIV, 2=SCROLL
+        self.encoder_mode = 0  # 0=TIME, 1=VOLTS, 2=SCROLL
+        self.encoder_mode_volts = False  # Legacy compatibility
         self.time_scale_index = 4  # Default: 1ms (index 4 in new array)
         self.volt_scale_index = 3  # Default: 0.5V (index 3 in new array)
+        self.scroll_step = 500  # Samples to scroll per encoder step
 
         self.time_scales = [
             ("50µs", 0.00005),
@@ -1013,8 +1158,11 @@ class MainWindow(QWidget):
 
     def update_display(self):
         """Update display with new data"""
-        voltages, times = self.reader.get_data()
-        self.display.set_data(voltages, times)
+        # Use memory buffer with scroll support
+        voltages, times = self.reader.get_data_from_memory(num_samples=4096)
+
+        if len(voltages) > 0:
+            self.display.set_data(voltages, times)
 
         # Update debug info
         self.update_debug_info()
@@ -1031,9 +1179,9 @@ class MainWindow(QWidget):
         self.reader.set_auto_trigger_50(enabled)
 
     def handle_encoder_rotation(self, direction):
-        """Handle encoder rotation"""
-        if not self.encoder_mode_volts:
-            # Time/Div mode
+        """Handle encoder rotation based on current mode"""
+        if self.encoder_mode == 0:
+            # TIME/DIV mode
             if direction > 0 and self.time_scale_index < len(self.time_scales) - 1:
                 self.time_scale_index += 1
             elif direction < 0 and self.time_scale_index > 0:
@@ -1042,8 +1190,9 @@ class MainWindow(QWidget):
             name, value = self.time_scales[self.time_scale_index]
             self.display.set_time_div(value)
             print(f"🎛️  Time/Div: {name}")
-        else:
-            # Volts/Div mode
+
+        elif self.encoder_mode == 1:
+            # VOLTS/DIV mode
             if direction > 0 and self.volt_scale_index < len(self.volt_scales) - 1:
                 self.volt_scale_index += 1
             elif direction < 0 and self.volt_scale_index > 0:
@@ -1053,12 +1202,44 @@ class MainWindow(QWidget):
             self.display.set_volt_div(value)
             print(f"🎛️  Volts/Div: {name}")
 
+        elif self.encoder_mode == 2:
+            # SCROLL mode - navigate through history
+            # CW (direction > 0) = scroll back (older data)
+            # CCW (direction < 0) = scroll forward (newer data)
+            scroll_amount = direction * self.scroll_step
+            self.reader.scroll(scroll_amount)
+
     def toggle_encoder_mode(self):
-        """Toggle encoder mode (Time/Div ↔ Volts/Div)"""
-        self.encoder_mode_volts = not self.encoder_mode_volts
-        mode_str = "VOLTS/DIV" if self.encoder_mode_volts else "TIME/DIV"
-        print(f"🎛️  Mode: {mode_str}")
-        self.info_label.setText(f"Encoder Mode:\n{mode_str}")
+        """Toggle encoder mode or pause/live when in scroll mode"""
+        # Special behavior in SCROLL mode: button toggles pause/live
+        if self.encoder_mode == 2:
+            is_paused = self.reader.toggle_pause()
+            if is_paused:
+                self.info_label.setText("SCROLL ⏸️\nPAUSED\n\nCW=Back CCW=Forward\nPress=Resume Live")
+            else:
+                self.info_label.setText("SCROLL ▶️\nLIVE\n\nPress to cycle modes")
+                # After resuming, cycle to next mode
+                self.encoder_mode = 0
+                print(f"🎛️  Mode: TIME/DIV (back to live)")
+                self.info_label.setText("Encoder Mode:\nTIME/DIV")
+            return
+
+        # Normal mode cycling: TIME/DIV → VOLTS/DIV → SCROLL
+        self.encoder_mode = (self.encoder_mode + 1) % 3
+        mode_names = ["TIME/DIV", "VOLTS/DIV", "SCROLL ⏪"]
+        mode_str = mode_names[self.encoder_mode]
+
+        # Legacy compatibility
+        self.encoder_mode_volts = (self.encoder_mode == 1)
+
+        # If entering scroll mode, show additional info
+        if self.encoder_mode == 2:
+            mem_info = self.reader.get_memory_info()
+            print(f"🎛️  Mode: {mode_str} (Memory: {mem_info['time_ms']:.0f}ms available)")
+            self.info_label.setText(f"Encoder Mode:\n{mode_str}\n\nCW=Back CCW=Forward\nPress=Pause")
+        else:
+            print(f"🎛️  Mode: {mode_str}")
+            self.info_label.setText(f"Encoder Mode:\n{mode_str}")
 
     def update_debug_info(self):
         """Update debug information labels"""
@@ -1091,10 +1272,18 @@ class MainWindow(QWidget):
         # Encoder stats
         rotations = self.encoder.rotation_count
         buttons = self.encoder.button_count
-        mode_str = "VOLTS/DIV" if self.encoder_mode_volts else "TIME/DIV"
+        mode_names = ["TIME/DIV", "VOLTS/DIV", "SCROLL"]
+        mode_str = mode_names[self.encoder_mode]
         last_dir = "CW⬆️" if self.encoder.last_direction > 0 else ("CCW⬇️" if self.encoder.last_direction < 0 else "---")
 
-        encoder_text = f"Encoder:\nRotations: {rotations} {last_dir}\nButtons: {buttons}\nMode: {mode_str}"
+        # Memory info
+        mem_info = self.reader.get_memory_info()
+        mem_samples = mem_info['samples']
+        mem_time = mem_info['time_ms']
+        offset_time = mem_info['offset_time_ms']
+        status = "⏸️PAUSED" if mem_info['is_paused'] else "▶️LIVE"
+
+        encoder_text = f"Encoder:\nRotations: {rotations} {last_dir}\nButtons: {buttons}\nMode: {mode_str}\n\nMemory: {mem_time:.0f}ms\nOffset: -{offset_time:.0f}ms\nStatus: {status}"
         self.debug_encoder.setText(encoder_text)
 
     def keyPressEvent(self, event):
@@ -1111,15 +1300,44 @@ class MainWindow(QWidget):
             self.handle_encoder_rotation(1)
         elif event.key() == Qt.Key_Up:
             # Switch to Volts mode and increase
+            self.encoder_mode = 1  # VOLTS mode
             self.encoder_mode_volts = True
             self.handle_encoder_rotation(1)
         elif event.key() == Qt.Key_Down:
             # Switch to Volts mode and decrease
+            self.encoder_mode = 1  # VOLTS mode
             self.encoder_mode_volts = True
             self.handle_encoder_rotation(-1)
         elif event.key() == Qt.Key_Space:
             # Toggle encoder mode
             self.toggle_encoder_mode()
+
+        # Pause/Resume (Key 'P')
+        elif event.key() == Qt.Key_P and not event.isAutoRepeat():
+            is_paused = self.reader.toggle_pause()
+            status = "PAUSED ⏸️" if is_paused else "LIVE ▶️"
+            print(f"📹 {status}")
+
+        # Go to Live (Key 'L' or Home)
+        elif event.key() in (Qt.Key_L, Qt.Key_Home) and not event.isAutoRepeat():
+            self.reader.go_to_live()
+            self.encoder_mode = 0  # Back to TIME mode
+            self.encoder_mode_volts = False
+
+        # Scroll history (PageUp/PageDown)
+        elif event.key() == Qt.Key_PageUp:
+            # Scroll back (older data)
+            self.reader.scroll(self.scroll_step * 5)
+        elif event.key() == Qt.Key_PageDown:
+            # Scroll forward (newer data)
+            self.reader.scroll(-self.scroll_step * 5)
+
+        # Enter scroll mode (Key 'S')
+        elif event.key() == Qt.Key_S and not event.isAutoRepeat():
+            self.encoder_mode = 2  # SCROLL mode
+            mem_info = self.reader.get_memory_info()
+            print(f"🎛️  Mode: SCROLL (Memory: {mem_info['time_ms']:.0f}ms available)")
+            self.info_label.setText("Encoder Mode:\nSCROLL ⏪\n\nCW=Back CCW=Forward\nPress=Pause")
 
         super().keyPressEvent(event)
 
