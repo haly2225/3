@@ -817,6 +817,9 @@ class SPIReader:
 # Scope Display Widget
 # ============================================================================
 class ScopeDisplay(QWidget):
+    # Signal for double-click fullscreen toggle
+    doubleClicked = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setMinimumSize(800, 600)
@@ -837,6 +840,11 @@ class ScopeDisplay(QWidget):
 
         # Drawing mode: 'line' or 'step'
         self.draw_mode = 'step'  # Step mode for square wave visualization
+
+    def mouseDoubleClickEvent(self, event):
+        """Handle double-click to toggle fullscreen"""
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
 
     def set_data(self, voltages, times):
         """Update waveform data"""
@@ -1013,10 +1021,15 @@ class MainWindow(QWidget):
         self.setWindowTitle("Professional Oscilloscope - Python")
         self.resize(1400, 900)
 
+        # Fullscreen mode
+        self.is_fullscreen = False
+        self.panel = None  # Will store control panel reference
+
         # Initialize components
         self.reader = SPIReader()
         self.encoder = RotaryEncoder()
         self.display = ScopeDisplay()
+        self.display.doubleClicked.connect(self.toggle_fullscreen)
 
         # Encoder mode: 0=TIME/DIV, 1=VOLTS/DIV, 2=SCROLL
         self.encoder_mode = 0  # 0=TIME, 1=VOLTS, 2=SCROLL
@@ -1077,10 +1090,10 @@ class MainWindow(QWidget):
         main_layout.addWidget(self.display, 3)
 
         # Right: Control panel
-        panel = QWidget()
-        panel.setStyleSheet("background-color: #2a2a2a;")
-        panel.setFixedWidth(220)
-        panel_layout = QVBoxLayout(panel)
+        self.panel = QWidget()
+        self.panel.setStyleSheet("background-color: #2a2a2a;")
+        self.panel.setFixedWidth(220)
+        panel_layout = QVBoxLayout(self.panel)
 
         # Title
         title = QLabel("CONTROLS")
@@ -1148,11 +1161,11 @@ class MainWindow(QWidget):
         panel_layout.addStretch()
 
         # Info label
-        self.info_label = QLabel("Use Encoder or\nArrow Keys")
+        self.info_label = QLabel("Use Encoder or\nArrow Keys\n\nF11/F = Fullscreen\nDouble-click = Full")
         self.info_label.setStyleSheet("color: #888; font-size: 10px;")
         panel_layout.addWidget(self.info_label)
 
-        main_layout.addWidget(panel)
+        main_layout.addWidget(self.panel)
 
     def update_display(self):
         """Update display with new data"""
@@ -1247,6 +1260,21 @@ class MainWindow(QWidget):
         else:
             print(f"🎛️  Mode: {mode_str}")
             self.info_label.setText(f"Encoder Mode:\n{mode_str}")
+
+    def toggle_fullscreen(self):
+        """Toggle fullscreen mode - waveform only"""
+        if self.is_fullscreen:
+            # Exit fullscreen
+            self.showNormal()
+            self.panel.show()
+            self.is_fullscreen = False
+            print("🖥️  Exit fullscreen mode")
+        else:
+            # Enter fullscreen - hide panel, show only waveform
+            self.panel.hide()
+            self.showFullScreen()
+            self.is_fullscreen = True
+            print("🖥️  Fullscreen mode (Press F11 or ESC to exit)")
 
     def update_debug_info(self):
         """Update debug information labels"""
@@ -1346,6 +1374,15 @@ class MainWindow(QWidget):
             print(f"🎛️  Mode: SCROLL (Memory: {mem_info['time_ms']:.0f}ms available)")
             self.info_label.setText("Encoder Mode:\nSCROLL ⏪\n\nCW=Back CCW=Forward\nPress=Pause")
 
+        # Fullscreen toggle (F11 or F key)
+        elif event.key() in (Qt.Key_F11, Qt.Key_F) and not event.isAutoRepeat():
+            self.toggle_fullscreen()
+
+        # ESC to exit fullscreen
+        elif event.key() == Qt.Key_Escape:
+            if self.is_fullscreen:
+                self.toggle_fullscreen()
+
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
@@ -1363,6 +1400,16 @@ def main():
 
     print("=" * 60)
     print("Professional Oscilloscope - Python Version")
+    print("=" * 60)
+    print("Keyboard shortcuts:")
+    print("  F11/F    = Toggle fullscreen (waveform only)")
+    print("  ESC      = Exit fullscreen")
+    print("  P        = Pause/Resume")
+    print("  L/Home   = Go to live view")
+    print("  S        = Scroll mode")
+    print("  A        = Auto Trigger 50%")
+    print("  Arrows   = Adjust Time/Volt scales")
+    print("  Double-click on waveform = Fullscreen")
     print("=" * 60)
 
     window = MainWindow()
