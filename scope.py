@@ -46,15 +46,13 @@ from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 # Constants
 MARKER_START = 0xAA
 MARKER_HEADER = 0x55
-BUFFER_SIZE = 2048  # Increased from 512 for full waveform display
-                     # At 411kHz sample rate with 1kHz signal:
-                     # - 1 cycle = 411 samples
-                     # - 2048 samples = 4.98 cycles (~5 full cycles)
+BUFFER_SIZE = 512  # MUST match STM32 firmware packet size!
 PACKET_SIZE = 4 + BUFFER_SIZE * 2
 SAMPLE_RATE = 411000.0  # Hz
 VCC = 3.3  # Volts
 ADC_MAX = 4095
-CAPTURE_SIZE = 2048  # Match BUFFER_SIZE
+CAPTURE_SIZE = 512
+DISPLAY_SAMPLES = 4096  # Show more samples using memory buffer
 
 class TriggerMode(Enum):
     AUTO = 0
@@ -1159,7 +1157,7 @@ class MainWindow(QWidget):
     def update_display(self):
         """Update display with new data"""
         # Use memory buffer with scroll support
-        voltages, times = self.reader.get_data_from_memory(num_samples=4096)
+        voltages, times = self.reader.get_data_from_memory(num_samples=DISPLAY_SAMPLES)
 
         if len(voltages) > 0:
             self.display.set_data(voltages, times)
