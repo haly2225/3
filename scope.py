@@ -841,6 +841,9 @@ class ScopeDisplay(QWidget):
         # Drawing mode: 'line' or 'step'
         self.draw_mode = 'step'  # Step mode for square wave visualization
 
+        # Auto-fit mode: waveform always fills screen width
+        self.auto_fit = True  # Default ON - always fill screen
+
     def mouseDoubleClickEvent(self, event):
         """Handle double-click to toggle fullscreen"""
         self.doubleClicked.emit()
@@ -940,22 +943,31 @@ class ScopeDisplay(QWidget):
         v_center = VCC / 2.0
         v_range = self.volt_div * 4  # 4 divisions above/below center
         t_range = self.time_div * 10  # 10 divisions
+        num_samples = len(self.voltages)
 
         if self.draw_mode == 'step':
             # Step drawing (better for square waves)
-            for i in range(len(self.voltages) - 1):
+            for i in range(num_samples - 1):
                 if i >= len(self.times):
                     break
 
-                # Convert to screen coordinates
-                t1 = self.times[i]
                 v1 = self.voltages[i]
-                t2 = self.times[i+1]
                 v2 = self.voltages[i+1]
 
-                x1 = (t1 / t_range) * w
+                # X coordinate: auto-fit or time-based
+                if self.auto_fit:
+                    # Auto-fit: always fill screen width
+                    x1 = (i / (num_samples - 1)) * w
+                    x2 = ((i + 1) / (num_samples - 1)) * w
+                else:
+                    # Time-based: use time_div setting
+                    t1 = self.times[i]
+                    t2 = self.times[i+1]
+                    x1 = (t1 / t_range) * w
+                    x2 = (t2 / t_range) * w
+
+                # Y coordinate: voltage to screen
                 y1 = h / 2 + (v_center - v1) / v_range * (h / 2)
-                x2 = (t2 / t_range) * w
                 y2 = h / 2 + (v_center - v2) / v_range * (h / 2)
 
                 # Clip to screen
@@ -966,19 +978,27 @@ class ScopeDisplay(QWidget):
                     painter.drawLine(int(x2), int(y1), int(x2), int(y2))
         else:
             # Line drawing (original)
-            for i in range(len(self.voltages) - 1):
+            for i in range(num_samples - 1):
                 if i >= len(self.times):
                     break
 
-                # Convert to screen coordinates
-                t1 = self.times[i]
                 v1 = self.voltages[i]
-                t2 = self.times[i+1]
                 v2 = self.voltages[i+1]
 
-                x1 = (t1 / t_range) * w
+                # X coordinate: auto-fit or time-based
+                if self.auto_fit:
+                    # Auto-fit: always fill screen width
+                    x1 = (i / (num_samples - 1)) * w
+                    x2 = ((i + 1) / (num_samples - 1)) * w
+                else:
+                    # Time-based: use time_div setting
+                    t1 = self.times[i]
+                    t2 = self.times[i+1]
+                    x1 = (t1 / t_range) * w
+                    x2 = (t2 / t_range) * w
+
+                # Y coordinate: voltage to screen
                 y1 = h / 2 + (v_center - v1) / v_range * (h / 2)
-                x2 = (t2 / t_range) * w
                 y2 = h / 2 + (v_center - v2) / v_range * (h / 2)
 
                 # Clip to screen
@@ -990,17 +1010,21 @@ class ScopeDisplay(QWidget):
         painter.setPen(QPen(QColor(200, 200, 200), 1))
         painter.setFont(QFont("Monospace", 10))
 
-        # Time/Div
-        time_str = f"Time: {self.format_time(self.time_div)}/div"
+        # Calculate total time displayed
+        if len(self.voltages) > 0:
+            total_time = len(self.voltages) / SAMPLE_RATE
+            time_str = f"Samples: {len(self.voltages)} ({self.format_time(total_time)})"
+        else:
+            time_str = "No data"
         painter.drawText(10, 20, time_str)
 
         # Volts/Div
         volt_str = f"Volts: {self.volt_div:.2f}V/div"
         painter.drawText(10, 40, volt_str)
 
-        # Trigger mode
-        mode_str = f"Trigger: {self.trigger_mode.name}"
-        painter.drawText(10, 60, mode_str)
+        # Auto-fit status
+        fit_str = "Auto-Fit: ON" if self.auto_fit else f"Time: {self.format_time(self.time_div)}/div"
+        painter.drawText(10, 60, fit_str)
 
     def format_time(self, seconds):
         """Format time with appropriate unit"""
@@ -1161,7 +1185,7 @@ class MainWindow(QWidget):
         panel_layout.addStretch()
 
         # Info label
-        self.info_label = QLabel("Use Encoder or\nArrow Keys\n\nF11/F = Fullscreen\nDouble-click = Full")
+        self.info_label = QLabel("Use Encoder or\nArrow Keys\n\nF/F11 = Fullscreen\nT = Auto-Fit\nDouble-click = Full")
         self.info_label.setStyleSheet("color: #888; font-size: 10px;")
         panel_layout.addWidget(self.info_label)
 
@@ -1347,6 +1371,12 @@ class MainWindow(QWidget):
             # Toggle encoder mode
             self.toggle_encoder_mode()
 
+        # Toggle Auto-Fit (Key 'T')
+        elif event.key() == Qt.Key_T and not event.isAutoRepeat():
+            self.display.auto_fit = not self.display.auto_fit
+            status = "ON (fill screen)" if self.display.auto_fit else "OFF (use Time/Div)"
+            print(f"📐 Auto-Fit: {status}")
+
         # Pause/Resume (Key 'P')
         elif event.key() == Qt.Key_P and not event.isAutoRepeat():
             is_paused = self.reader.toggle_pause()
@@ -1404,6 +1434,7 @@ def main():
     print("Keyboard shortcuts:")
     print("  F11/F    = Toggle fullscreen (waveform only)")
     print("  ESC      = Exit fullscreen")
+    print("  T        = Toggle Auto-Fit (fill screen)")
     print("  P        = Pause/Resume")
     print("  L/Home   = Go to live view")
     print("  S        = Scroll mode")
