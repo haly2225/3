@@ -2,7 +2,14 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32 Oscilloscope - 600kHz Safe Mode
+  * @brief          : STM32 Oscilloscope - Double Buffering (No Data Gaps)
+  ******************************************************************************
+  * DOUBLE BUFFERING (PING-PONG) IMPLEMENTATION:
+  * - ADC runs continuously with DMA in CIRCULAR mode
+  * - Uses 2x buffer: adc_buffer[1024] = Buffer_A[512] + Buffer_B[512]
+  * - Half-Complete callback: Buffer_A ready → Pack and send via SPI
+  * - Full-Complete callback: Buffer_B ready → Pack and send via SPI
+  * - NO BLIND SPOTS: ADC never stops sampling!
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -10,6 +17,7 @@
 #include <string.h>
 
 #define BUFFER_SIZE          512
+#define DOUBLE_BUFFER_SIZE   (BUFFER_SIZE * 2)  // 1024 samples total
 #define TX_BYTES             (BUFFER_SIZE * 2 + 4)
 
 ADC_HandleTypeDef hadc1;
@@ -18,11 +26,17 @@ SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
 TIM_HandleTypeDef htim2;
 
-uint16_t adc_buffer[BUFFER_SIZE] __attribute__((aligned(4)));
-uint8_t  tx_buffer[TX_BYTES] __attribute__((aligned(4)));
+// Double buffer: [Buffer_A (512)] [Buffer_B (512)]
+// ADC DMA runs in CIRCULAR mode, continuously filling this buffer
+uint16_t adc_buffer[DOUBLE_BUFFER_SIZE] __attribute__((aligned(4)));
+
+// TX buffer for SPI transmission
+uint8_t tx_buffer[TX_BYTES] __attribute__((aligned(4)));
 
 volatile uint16_t frame_counter = 0;
-volatile uint8_t buffer_ready = 0;
+volatile uint8_t buffer_a_ready = 0;  // Buffer A (first half) ready
+volatile uint8_t buffer_b_ready = 0;  // Buffer B (second half) ready
+volatile uint8_t spi_busy = 0;        // SPI DMA in progress
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -31,15 +45,19 @@ static void MX_ADC1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM2_Init(void);
 
-void pack_buffer(void)
+/**
+  * @brief Pack buffer data into SPI TX format
+  * @param source: Pointer to source ADC data (512 samples)
+  */
+void pack_buffer(uint16_t* source)
 {
-  tx_buffer[0] = 0xAA;
-  tx_buffer[1] = 0x55;
+  tx_buffer[0] = 0xAA;  // Marker start
+  tx_buffer[1] = 0x55;  // Marker header
   tx_buffer[2] = (frame_counter >> 8) & 0xFF;
   tx_buffer[3] = frame_counter & 0xFF;
 
   for (uint16_t i = 0; i < BUFFER_SIZE; i++) {
-    uint16_t val = adc_buffer[i];
+    uint16_t val = source[i];
     tx_buffer[4 + i*2] = (val >> 8) & 0xFF;
     tx_buffer[4 + i*2 + 1] = val & 0xFF;
   }
@@ -47,10 +65,37 @@ void pack_buffer(void)
   frame_counter++;
 }
 
+/**
+  * @brief ADC DMA Half-Complete Callback
+  *        Called when first half (Buffer A) is filled
+  *        ADC continues filling Buffer B in background
+  */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  // Buffer A (first 512 samples) is ready
+  // ADC is now filling Buffer B - NO INTERRUPTION!
+  buffer_a_ready = 1;
+}
+
+/**
+  * @brief ADC DMA Complete Callback
+  *        Called when second half (Buffer B) is filled
+  *        ADC wraps around and continues filling Buffer A
+  */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  pack_buffer();
-  buffer_ready = 1;
+  // Buffer B (second 512 samples) is ready
+  // ADC wraps around to fill Buffer A - NO INTERRUPTION!
+  buffer_b_ready = 1;
+}
+
+/**
+  * @brief SPI DMA Complete Callback
+  *        Called when SPI transmission is complete
+  */
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+  spi_busy = 0;
 }
 
 int main(void)
@@ -67,6 +112,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_ADCEx_Calibration_Start(&hadc1);
 
+  // LED blink to indicate startup
   for (int i = 0; i < 3; i++) {
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
     HAL_Delay(100);
@@ -74,14 +120,14 @@ int main(void)
     HAL_Delay(100);
   }
 
-  for (int i = 0; i < BUFFER_SIZE; i++) {
-    adc_buffer[i] = 0;
-  }
-  pack_buffer();
+  // Clear buffer
+  memset(adc_buffer, 0, sizeof(adc_buffer));
 
-  HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
-  HAL_Delay(10);
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, BUFFER_SIZE);
+  // Start ADC with DMA in CIRCULAR mode
+  // This will run continuously, ping-ponging between Buffer A and Buffer B
+  // Half-Complete interrupt fires when Buffer A is ready
+  // Complete interrupt fires when Buffer B is ready
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, DOUBLE_BUFFER_SIZE);
 
   uint32_t last_led_toggle = 0;
   uint8_t led_state = 0;
@@ -90,20 +136,35 @@ int main(void)
   {
     uint32_t now = HAL_GetTick();
 
+    // LED heartbeat (toggle every 100ms)
     if (now - last_led_toggle >= 100) {
       last_led_toggle = now;
       led_state = !led_state;
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, led_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
 
-    if (buffer_ready) {
-      buffer_ready = 0;
+    // Process Buffer A when ready (and SPI is free)
+    if (buffer_a_ready && !spi_busy) {
+      buffer_a_ready = 0;
+      spi_busy = 1;
 
-      // Send data via SPI DMA
+      // Pack data from Buffer A (first half of adc_buffer)
+      pack_buffer(&adc_buffer[0]);
+
+      // Send via SPI DMA (non-blocking)
       HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
+    }
 
-      // Restart ADC for next capture
-      HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, BUFFER_SIZE);
+    // Process Buffer B when ready (and SPI is free)
+    if (buffer_b_ready && !spi_busy) {
+      buffer_b_ready = 0;
+      spi_busy = 1;
+
+      // Pack data from Buffer B (second half of adc_buffer)
+      pack_buffer(&adc_buffer[BUFFER_SIZE]);
+
+      // Send via SPI DMA (non-blocking)
+      HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
     }
   }
 }
@@ -151,7 +212,7 @@ static void MX_ADC1_Init(void)
 
   hadc1.Instance = ADC1;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;  // Continuous mode for non-stop sampling
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
@@ -161,7 +222,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  sConfig.Channel = ADC_CHANNEL_8;
+  sConfig.Channel = ADC_CHANNEL_8;  // PB0
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
@@ -240,9 +301,11 @@ static void MX_DMA_Init(void)
 {
   __HAL_RCC_DMA1_CLK_ENABLE();
 
+  // ADC DMA - highest priority for continuous sampling
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 
+  // SPI DMA - lower priority
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 }
