@@ -1026,6 +1026,7 @@ class SPIReader:
         - Requires STABLE LOW state before accepting rising edge
         - Larger hysteresis for clipped signals
         - Prevents false triggers from ringing/noise
+        - Returns FLOAT for sub-sample accuracy (interpolation)
         """
         if len(data) < 50:
             return -1
@@ -1036,13 +1037,13 @@ class SPIReader:
         # ADAPTIVE HYSTERESIS based on signal characteristics
         is_clipped = (self.vmax_latest >= 3.25) or (self.vmin_latest <= 0.05)
         if is_clipped:
-            # Clipped signal: Use 15% of Vpp, minimum 0.3V
-            hysteresis = max(0.3, vpp * 0.15)
-            min_stable_samples = 15  # Require 15 samples in LOW state
+            # Clipped signal: Use 12% of Vpp, minimum 0.25V (reduced from 15%/0.3V)
+            hysteresis = max(0.25, vpp * 0.12)
+            min_stable_samples = 10  # Reduced from 15 for more triggers
         else:
-            # Normal signal: Use 10% of Vpp, minimum 0.1V
-            hysteresis = max(0.1, vpp * 0.10)
-            min_stable_samples = 5
+            # Normal signal: Use 8% of Vpp, minimum 0.08V
+            hysteresis = max(0.08, vpp * 0.08)
+            min_stable_samples = 4
 
         # Scan first 40% of data (leave 60% for display after trigger)
         scan_limit = int(len(data) * 0.4)
@@ -1052,11 +1053,12 @@ class SPIReader:
         low_state_count = 0
 
         if self.trigger_slope == TriggerSlope.RISING:
-            for i in range(len(data)):
+            for i in range(1, len(data)):
                 if i >= scan_limit:
                     break
 
                 v = data[i]
+                v_prev = data[i-1]
 
                 # Check if in LOW state (below level - hysteresis)
                 if v < (level - hysteresis):
@@ -1067,11 +1069,20 @@ class SPIReader:
                         low_state_count += 1
 
                 # Check if crossing to HIGH (above level)
-                elif v >= level:
+                elif v >= level and v_prev < level:
                     if in_low_state and low_state_count >= min_stable_samples:
                         # Valid rising edge: was LOW long enough
+                        # SUB-SAMPLE INTERPOLATION for precise crossing
+                        if v != v_prev:
+                            # Linear interpolation to find exact crossing
+                            fraction = (level - v_prev) / (v - v_prev)
+                            return (i - 1) + fraction
                         return i
                     # Reset state - not a valid trigger
+                    in_low_state = False
+                    low_state_count = 0
+                elif v >= level:
+                    # Still in HIGH but not a crossing
                     in_low_state = False
                     low_state_count = 0
         else:
@@ -1079,11 +1090,12 @@ class SPIReader:
             in_high_state = False
             high_state_count = 0
 
-            for i in range(len(data)):
+            for i in range(1, len(data)):
                 if i >= scan_limit:
                     break
 
                 v = data[i]
+                v_prev = data[i-1]
 
                 # Check if in HIGH state (above level + hysteresis)
                 if v > (level + hysteresis):
@@ -1094,9 +1106,16 @@ class SPIReader:
                         high_state_count += 1
 
                 # Check if crossing to LOW (below level)
-                elif v <= level:
+                elif v <= level and v_prev > level:
                     if in_high_state and high_state_count >= min_stable_samples:
+                        # SUB-SAMPLE INTERPOLATION
+                        if v != v_prev:
+                            fraction = (level - v_prev) / (v - v_prev)
+                            return (i - 1) + fraction
                         return i
+                    in_high_state = False
+                    high_state_count = 0
+                elif v <= level:
                     in_high_state = False
                     high_state_count = 0
 
@@ -1161,16 +1180,42 @@ class SPIReader:
             # 3. Extract display data based on trigger
             if trigger_offset >= 0:
                 # TRIGGER FOUND: Start display from trigger point
-                available = len(raw_data) - trigger_offset
-                take = min(available, num_points)
-                display_data = raw_data[trigger_offset:trigger_offset + take]
+                # trigger_offset can be float (sub-sample interpolation)
+                int_offset = int(trigger_offset)
+                frac_offset = trigger_offset - int_offset
 
-                # Generate time array
-                times = [i / SAMPLE_RATE for i in range(len(display_data))]
+                available = len(raw_data) - int_offset - 1  # -1 for interpolation
+                take = min(available, num_points)
+
+                if take <= 0:
+                    if self.last_triggered_data:
+                        return self.last_triggered_data, self.last_triggered_times
+                    return [], []
+
+                # Extract data with SUB-SAMPLE shift using linear interpolation
+                if frac_offset > 0.01 and int_offset + take + 1 <= len(raw_data):
+                    # Interpolate each sample to shift by fractional amount
+                    display_data = []
+                    for j in range(take):
+                        idx = int_offset + j
+                        if idx + 1 < len(raw_data):
+                            # Linear interpolation: v = v0 + frac * (v1 - v0)
+                            v0 = raw_data[idx]
+                            v1 = raw_data[idx + 1]
+                            v = v0 + frac_offset * (v1 - v0)
+                            display_data.append(v)
+                        else:
+                            display_data.append(raw_data[idx])
+                else:
+                    # No fractional shift needed
+                    display_data = raw_data[int_offset:int_offset + take]
+
+                # Generate time array (shift by fractional offset)
+                times = [(i - frac_offset) / SAMPLE_RATE for i in range(len(display_data))]
 
                 # SAVE as last triggered frame (for hold feature)
-                self.last_triggered_data = display_data.copy()
-                self.last_triggered_times = times.copy()
+                self.last_triggered_data = list(display_data)
+                self.last_triggered_times = list(times)
                 self.trigger_hold_count = 0
                 self.trigger_found_count += 1
 
@@ -1184,9 +1229,9 @@ class SPIReader:
                 self.trigger_hold_count += 1
 
                 if self.trigger_mode == TriggerMode.AUTO:
-                    # AUTO MODE: Hold for a few frames, then show live
-                    if self.trigger_hold_count <= 5 and self.last_triggered_data:
-                        # Hold last triggered frame (up to 5 frames = 250ms at 20FPS)
+                    # AUTO MODE: Hold for more frames (10 = 500ms at 20FPS)
+                    if self.trigger_hold_count <= 10 and self.last_triggered_data:
+                        # Hold last triggered frame to prevent jitter
                         return self.last_triggered_data, self.last_triggered_times
                     else:
                         # Fall back to showing live data (no trigger lock)
