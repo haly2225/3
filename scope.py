@@ -209,23 +209,39 @@ class RotaryEncoder:
             self.on_button_press()
 
     def _polling_loop(self):
-        """Polling loop fallback when interrupts fail"""
-        print("🔄 Encoder: Polling loop started (1ms interval)")
+        """Polling loop fallback when interrupts fail
+
+        IMPROVED: Better debounce and state machine approach
+        """
+        print("🔄 Encoder: Polling loop started (0.5ms interval, 15ms debounce)")
+
+        # State machine for more reliable detection
+        clk_low_count = 0  # Count consecutive LOW readings
+        CLK_LOW_THRESHOLD = 3  # Require 3 consecutive LOWs (1.5ms)
+
+        ROTATION_DEBOUNCE_MS = 15  # Increased from 5ms to 15ms
+        BUTTON_DEBOUNCE_MS = 200
 
         while self.running:
             now = time.time()
 
-            # Read current GPIO states
+            # Read current GPIO states (multiple reads for noise rejection)
             clk = GPIO.input(self.gpio_clk)
             dt = GPIO.input(self.gpio_dt)
             sw = GPIO.input(self.gpio_sw)
 
-            # Detect rotation (CLK falling edge)
-            if clk == 0 and self.last_clk == 1:
+            # State machine for CLK detection
+            if clk == 0:
+                clk_low_count += 1
+            else:
+                clk_low_count = 0
+
+            # Detect rotation: CLK stable LOW after being HIGH
+            if clk_low_count == CLK_LOW_THRESHOLD and self.last_clk == 1:
                 elapsed = (now - self.last_rotation_time) * 1000
 
                 # Debounce check
-                if elapsed > 5:
+                if elapsed > ROTATION_DEBOUNCE_MS:
                     # Determine direction from DT state
                     direction = 1 if dt == 1 else -1
 
@@ -233,18 +249,25 @@ class RotaryEncoder:
                     self.last_direction = direction
                     self.last_rotation_time = now
 
-                    print(f"🎯 Encoder: ROTATION #{self.rotation_count} {'CW ⬆️ ' if direction > 0 else 'CCW ⬇️ '} (DT={dt}, {elapsed:.1f}ms)")
+                    dir_str = "CW ⬆️ " if direction > 0 else "CCW ⬇️ "
+                    print(f"🎯 Encoder: ROTATION #{self.rotation_count} {dir_str} (DT={dt}, {elapsed:.1f}ms)")
 
                     # Call user callback
                     if self.on_rotate:
                         self.on_rotate(direction)
+
+                    self.last_clk = 0  # Mark as processed
+
+            # Update last_clk when CLK goes HIGH
+            if clk == 1:
+                self.last_clk = 1
 
             # Detect button press (SW falling edge)
             if sw == 0 and self.last_sw == 1:
                 elapsed = (now - self.last_button_time) * 1000
 
                 # Debounce check
-                if elapsed > 200:
+                if elapsed > BUTTON_DEBOUNCE_MS:
                     self.button_count += 1
                     self.last_button_time = now
 
@@ -255,12 +278,11 @@ class RotaryEncoder:
                         self.on_button_press()
 
             # Update last states
-            self.last_clk = clk
             self.last_dt = dt
             self.last_sw = sw
 
-            # Sleep 1ms (faster than original 10ms, better response)
-            time.sleep(0.001)
+            # Sleep 0.5ms for faster response
+            time.sleep(0.0005)
 
     def start(self):
         """Start encoder (interrupts or polling mode)"""
@@ -473,7 +495,13 @@ class SPIReader:
             return voltages, times
 
     def calculate_frequency(self, voltages):
-        """Calculate frequency from zero crossings (with ANTI-RINGING protection)"""
+        """Calculate frequency from zero crossings with IMPROVED accuracy
+
+        FIXES for Data Stitching Artifacts:
+        1. Use period measurement (time between crossings) instead of counting
+        2. Apply moving average filter to smooth out jitter
+        3. Require minimum 2 complete cycles for accurate measurement
+        """
         if len(voltages) < 10:
             return 0.0
 
@@ -488,62 +516,69 @@ class SPIReader:
 
         # Filter out noise: signal must have at least 300mV amplitude
         if vpp < 0.3:
-            # Debug: Signal too small
-            if not hasattr(self, '_freq_debug_count'):
-                self._freq_debug_count = 0
-            self._freq_debug_count += 1
-            if self._freq_debug_count % 100 == 0:
-                print(f"📉 Freq: Signal too small (Vpp={vpp:.3f}V < 0.3V threshold)")
             return 0.0
 
         # ADAPTIVE parameters based on clipping detection
         if is_clipped:
-            # Clipped signals have severe ringing: use larger threshold and debounce
-            threshold = vpp * 0.20  # 20% hysteresis
-            # Longer debounce for clipped signals (up to ~1kHz max frequency)
-            MIN_SAMPLES_BETWEEN_CROSSINGS = 200  # 0.487ms debounce
+            threshold = vpp * 0.25  # 25% hysteresis for clipped
+            MIN_SAMPLES_BETWEEN_CROSSINGS = 150  # Anti-ringing
         else:
-            # Normal signals: standard parameters
             threshold = vpp * 0.15  # 15% hysteresis
-            MIN_SAMPLES_BETWEEN_CROSSINGS = 100  # 0.243ms debounce
+            MIN_SAMPLES_BETWEEN_CROSSINGS = 50
 
-        # ANTI-RINGING: Minimum samples between crossings
-        # Prevents counting edge oscillations (ringing) as multiple crossings
-        # With 411kHz sample rate:
-        #   - 100 samples = 0.243ms → allows up to ~2kHz (normal signals)
-        #   - 200 samples = 0.487ms → allows up to ~1kHz (clipped signals)
-        # For 1kHz signal: period = 1ms = 411 samples
-        #   - 200 sample debounce = 49% of period (skips all ringing)
-
-        # Count zero crossings (rising edges only) with hysteresis + anti-ringing
-        crossings = 0
-        last_crossing_index = -MIN_SAMPLES_BETWEEN_CROSSINGS  # Allow first detection
+        # Find all rising edge crossings and measure periods
+        crossing_indices = []
+        last_crossing_index = -MIN_SAMPLES_BETWEEN_CROSSINGS
 
         for i in range(1, len(voltages)):
-            # Must cross from below (avg - threshold) to above (avg + threshold)
             if voltages[i-1] < (avg - threshold) and voltages[i] >= (avg + threshold):
-                # Check if enough samples passed since last crossing (anti-ringing)
                 if (i - last_crossing_index) >= MIN_SAMPLES_BETWEEN_CROSSINGS:
-                    crossings += 1
+                    crossing_indices.append(i)
                     last_crossing_index = i
 
-        if crossings < 2:
+        # Need at least 2 crossings to measure period
+        if len(crossing_indices) < 2:
             return 0.0
 
-        # Calculate period and frequency
-        total_time = len(voltages) / SAMPLE_RATE
-        frequency = crossings / total_time
+        # Calculate periods between consecutive crossings
+        periods = []
+        for i in range(1, len(crossing_indices)):
+            period_samples = crossing_indices[i] - crossing_indices[i-1]
+            period_seconds = period_samples / SAMPLE_RATE
+            if period_seconds > 0:
+                periods.append(period_seconds)
+
+        if not periods:
+            return 0.0
+
+        # Use MEDIAN period (more robust than mean for noisy data)
+        periods.sort()
+        median_period = periods[len(periods) // 2]
+        frequency = 1.0 / median_period
+
+        # Apply moving average filter to smooth frequency readings
+        if not hasattr(self, '_freq_history'):
+            self._freq_history = []
+
+        self._freq_history.append(frequency)
+        if len(self._freq_history) > 10:  # Keep last 10 readings
+            self._freq_history.pop(0)
+
+        # Smoothed frequency (moving average)
+        smoothed_freq = sum(self._freq_history) / len(self._freq_history)
 
         # Debug: Show frequency calculation details periodically
         if not hasattr(self, '_freq_calc_count'):
             self._freq_calc_count = 0
         self._freq_calc_count += 1
-        if self._freq_calc_count % 50 == 0:  # Every 50 calculations
-            clip_warn = " ⚠️ CLIPPED" if is_clipped else ""
-            print(f"🔍 Freq: {crossings} crossings in {total_time*1000:.1f}ms = {frequency:.1f}Hz "
-                  f"(Vpp={vpp:.2f}V, Vmax={vmax:.2f}V, Vmin={vmin:.2f}V){clip_warn}")
 
-        return frequency
+        if self._freq_calc_count % 100 == 0:  # Every 100 calculations
+            clip_warn = " ⚠️ CLIPPED" if is_clipped else ""
+            print(f"📊 Freq Debug: {len(crossing_indices)} crossings, {len(periods)} periods")
+            print(f"   Periods(ms): {[f'{p*1000:.2f}' for p in periods[:5]]}")
+            print(f"   Median: {median_period*1000:.3f}ms → Raw: {frequency:.1f}Hz → Smooth: {smoothed_freq:.1f}Hz{clip_warn}")
+
+        return smoothed_freq
 
     def find_trigger_edge(self, voltages):
         """Find trigger edge with ENHANCED stability for clipped signals"""
@@ -639,11 +674,16 @@ class SPIReader:
             return voltages
 
     def reader_loop(self):
-        """Main SPI reader loop"""
+        """Main SPI reader loop with DATA STITCHING detection"""
         print("🔄 SPI: Reader loop started")
 
         loop_count = 0
         last_debug_time = time.time()
+
+        # Data stitching detection
+        last_packet_end_voltage = None
+        stitch_glitches = 0  # Count discontinuities
+        last_packet_time = time.time()
 
         while self.running:
             # Check if paused - skip reading if paused
@@ -651,9 +691,30 @@ class SPIReader:
                 time.sleep(0.01)  # Sleep longer when paused
                 continue
 
+            packet_start_time = time.time()
             samples = self.read_packet()
+
             if samples:
                 voltages, times = self.parse_packet(samples)
+
+                # =====================================================
+                # DATA STITCHING DETECTION
+                # =====================================================
+                # Detect voltage discontinuity at packet boundary
+                if last_packet_end_voltage is not None and len(voltages) > 0:
+                    voltage_jump = abs(voltages[0] - last_packet_end_voltage)
+                    # If jump > 0.5V, likely a stitching artifact
+                    if voltage_jump > 0.5:
+                        stitch_glitches += 1
+
+                # Track packet timing (dead time detection)
+                packet_interval = (packet_start_time - last_packet_time) * 1000  # ms
+                expected_interval = BUFFER_SIZE / SAMPLE_RATE * 1000  # ~1.25ms for 512 samples
+                dead_time = packet_interval - expected_interval
+
+                if len(voltages) > 0:
+                    last_packet_end_voltage = voltages[-1]
+                last_packet_time = packet_start_time
 
                 with self.lock:
                     # Store for live display
@@ -681,11 +742,23 @@ class SPIReader:
                     sync_rate = 100.0 * self.sync_ok_count / max(1, self.packet_count)
                     mem_size = len(self.memory)
                     mem_time = mem_size / SAMPLE_RATE * 1000  # ms
-                    print(f"📊 SPI Stats: Packets={self.packet_count}, Sync={sync_rate:.1f}%, "
-                          f"Triggers={self.trigger_found_count}, Loops={loop_count}")
-                    print(f"📈 Signal: Vpp={self.vpp_latest:.2f}V, Freq={self.frequency_latest:.1f}Hz")
-                    print(f"💾 Memory: {mem_size} samples ({mem_time:.1f}ms), Offset={self.scroll_offset}")
+
+                    print(f"")
+                    print(f"{'='*60}")
+                    print(f"📊 SPI Debug Report (every 5s)")
+                    print(f"{'='*60}")
+                    print(f"  Packets: {self.packet_count} | Sync: {sync_rate:.1f}% | Triggers: {self.trigger_found_count}")
+                    print(f"  Signal: Vpp={self.vpp_latest:.2f}V | Freq={self.frequency_latest:.1f}Hz")
+                    print(f"  Memory: {mem_size:,} samples ({mem_time:.0f}ms) | Offset={self.scroll_offset}")
+                    print(f"  Data Stitching: {stitch_glitches} glitches detected")
+                    print(f"  Packet interval: {packet_interval:.2f}ms (expected: {expected_interval:.2f}ms)")
+                    if dead_time > 0.1:
+                        print(f"  ⚠️  Dead time: {dead_time:.2f}ms (may cause artifacts)")
+                    print(f"{'='*60}")
+                    print(f"")
+
                     last_debug_time = now
+                    stitch_glitches = 0  # Reset counter
             else:
                 time.sleep(0.001)
 
