@@ -372,6 +372,11 @@ class SPIReader:
         self.edge_index = 100  # Target edge position
         self.shift_samples = 0.0
 
+        # HOLD LAST FRAME - prevents drift when trigger is lost
+        self.last_triggered_data = []
+        self.last_triggered_times = []
+        self.trigger_hold_count = 0  # Count frames held without new trigger
+
         # Debug stats
         self.packet_count = 0
         self.sync_ok_count = 0
@@ -1017,40 +1022,94 @@ class SPIReader:
     def find_stable_trigger(self, data):
         """Find stable trigger point in data (Rising/Falling Edge)
 
-        This is called when displaying data, NOT when storing.
-        Returns index of trigger point, or -1 if not found.
+        IMPROVED: State machine approach for clipped signals
+        - Requires STABLE LOW state before accepting rising edge
+        - Larger hysteresis for clipped signals
+        - Prevents false triggers from ringing/noise
         """
-        if len(data) < 20:
+        if len(data) < 50:
             return -1
 
         level = self.trigger_level
+        vpp = self.vpp_latest
 
-        # Hysteresis to prevent noise triggering
-        # Scale with signal amplitude
-        hysteresis = 0.1 if (self.vpp_latest > 0.5) else 0.02
+        # ADAPTIVE HYSTERESIS based on signal characteristics
+        is_clipped = (self.vmax_latest >= 3.25) or (self.vmin_latest <= 0.05)
+        if is_clipped:
+            # Clipped signal: Use 15% of Vpp, minimum 0.3V
+            hysteresis = max(0.3, vpp * 0.15)
+            min_stable_samples = 15  # Require 15 samples in LOW state
+        else:
+            # Normal signal: Use 10% of Vpp, minimum 0.1V
+            hysteresis = max(0.1, vpp * 0.10)
+            min_stable_samples = 5
 
-        # Only scan first 1/3 of data to ensure enough data after trigger
-        # This ensures we have full waveform to display after trigger point
-        scan_limit = len(data) // 3
+        # Scan first 40% of data (leave 60% for display after trigger)
+        scan_limit = int(len(data) * 0.4)
+
+        # STATE MACHINE for stable trigger detection
+        in_low_state = False
+        low_state_count = 0
 
         if self.trigger_slope == TriggerSlope.RISING:
-            # Rising Edge: LOW -> crosses trigger level -> HIGH
-            for i in range(1, scan_limit):
-                if (data[i-1] < level - hysteresis) and (data[i] >= level):
-                    return i  # Found rising edge!
-        else:
-            # Falling Edge: HIGH -> crosses trigger level -> LOW
-            for i in range(1, scan_limit):
-                if (data[i-1] > level + hysteresis) and (data[i] <= level):
-                    return i  # Found falling edge!
+            for i in range(len(data)):
+                if i >= scan_limit:
+                    break
 
-        return -1  # No trigger found
+                v = data[i]
+
+                # Check if in LOW state (below level - hysteresis)
+                if v < (level - hysteresis):
+                    if not in_low_state:
+                        in_low_state = True
+                        low_state_count = 1
+                    else:
+                        low_state_count += 1
+
+                # Check if crossing to HIGH (above level)
+                elif v >= level:
+                    if in_low_state and low_state_count >= min_stable_samples:
+                        # Valid rising edge: was LOW long enough
+                        return i
+                    # Reset state - not a valid trigger
+                    in_low_state = False
+                    low_state_count = 0
+        else:
+            # FALLING edge - mirror logic
+            in_high_state = False
+            high_state_count = 0
+
+            for i in range(len(data)):
+                if i >= scan_limit:
+                    break
+
+                v = data[i]
+
+                # Check if in HIGH state (above level + hysteresis)
+                if v > (level + hysteresis):
+                    if not in_high_state:
+                        in_high_state = True
+                        high_state_count = 1
+                    else:
+                        high_state_count += 1
+
+                # Check if crossing to LOW (below level)
+                elif v <= level:
+                    if in_high_state and high_state_count >= min_stable_samples:
+                        return i
+                    in_high_state = False
+                    high_state_count = 0
+
+        return -1  # No valid trigger found
 
     def get_triggered_data(self, num_points=1000):
         """Get data from memory WITH TRIGGER applied for stable display
 
         "Xử lý Tinh" - Apply trigger when getting data for display.
         This keeps waveform locked to trigger point, preventing drift.
+
+        IMPROVED: "Hold Last Frame" - when trigger is lost, keep showing
+        the last successfully triggered frame to prevent drift.
 
         Args:
             num_points: Number of samples to return for display
@@ -1063,10 +1122,13 @@ class SPIReader:
 
             # Need at least 2x display points for search window
             if mem_len < num_points * 2:
+                # Not enough data - return last frame if available
+                if self.last_triggered_data:
+                    return self.last_triggered_data, self.last_triggered_times
                 return [], []
 
-            # 1. Get a WIDER window than needed (1.5x) for trigger search
-            search_window = int(num_points * 1.5)
+            # 1. Get a WIDER window than needed (2x) for trigger search
+            search_window = int(num_points * 2)
 
             # Calculate position based on scroll offset
             end_idx = mem_len - self.scroll_offset
@@ -1078,6 +1140,8 @@ class SPIReader:
             if end_idx > mem_len:
                 end_idx = mem_len
             if end_idx <= start_idx:
+                if self.last_triggered_data:
+                    return self.last_triggered_data, self.last_triggered_times
                 return [], []
 
             # Extract raw data from ring buffer
@@ -1085,38 +1149,68 @@ class SPIReader:
             raw_data = mem_list[start_idx:end_idx]
 
             if not raw_data:
+                if self.last_triggered_data:
+                    return self.last_triggered_data, self.last_triggered_times
                 return [], []
 
             # 2. Find trigger point (only if not FREE_RUN mode)
-            trigger_offset = 0
+            trigger_offset = -1
             if self.trigger_mode != TriggerMode.FREE_RUN:
                 trigger_offset = self.find_stable_trigger(raw_data)
 
             # 3. Extract display data based on trigger
-            display_data = []
-
             if trigger_offset >= 0:
-                # Trigger found: Start display from trigger point
+                # TRIGGER FOUND: Start display from trigger point
                 available = len(raw_data) - trigger_offset
                 take = min(available, num_points)
                 display_data = raw_data[trigger_offset:trigger_offset + take]
+
+                # Generate time array
+                times = [i / SAMPLE_RATE for i in range(len(display_data))]
+
+                # SAVE as last triggered frame (for hold feature)
+                self.last_triggered_data = display_data.copy()
+                self.last_triggered_times = times.copy()
+                self.trigger_hold_count = 0
                 self.trigger_found_count += 1
+
+                # Calculate frequency on triggered (stable) data
+                if len(display_data) > 10:
+                    self.frequency_latest = self.calculate_frequency(display_data)
+
+                return display_data, times
             else:
-                # No trigger: Show most recent data (prevents black screen)
-                # In NORMAL mode, could hold last triggered frame instead
-                start_view = len(raw_data) - num_points
-                if start_view < 0:
-                    start_view = 0
-                display_data = raw_data[start_view:]
+                # NO TRIGGER FOUND - use "Hold Last Frame" strategy
+                self.trigger_hold_count += 1
 
-            # Generate time array
-            times = [i / SAMPLE_RATE for i in range(len(display_data))]
+                if self.trigger_mode == TriggerMode.AUTO:
+                    # AUTO MODE: Hold for a few frames, then show live
+                    if self.trigger_hold_count <= 5 and self.last_triggered_data:
+                        # Hold last triggered frame (up to 5 frames = 250ms at 20FPS)
+                        return self.last_triggered_data, self.last_triggered_times
+                    else:
+                        # Fall back to showing live data (no trigger lock)
+                        start_view = len(raw_data) - num_points
+                        if start_view < 0:
+                            start_view = 0
+                        display_data = raw_data[start_view:]
+                        times = [i / SAMPLE_RATE for i in range(len(display_data))]
+                        return display_data, times
 
-            # Calculate frequency on triggered (stable) data
-            if len(display_data) > 10:
-                self.frequency_latest = self.calculate_frequency(display_data)
+                elif self.trigger_mode == TriggerMode.NORMAL:
+                    # NORMAL MODE: Always hold last triggered frame
+                    if self.last_triggered_data:
+                        return self.last_triggered_data, self.last_triggered_times
+                    return [], []
 
-            return display_data, times
+                else:
+                    # FREE_RUN MODE: Just show live data
+                    start_view = len(raw_data) - num_points
+                    if start_view < 0:
+                        start_view = 0
+                    display_data = raw_data[start_view:]
+                    times = [i / SAMPLE_RATE for i in range(len(display_data))]
+                    return display_data, times
 
     def set_trigger_mode(self, mode):
         """Set trigger mode"""
