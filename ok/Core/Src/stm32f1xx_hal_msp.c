@@ -22,13 +22,25 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* hadc)
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+    /* ================================================================
+     * ADC DMA - CIRCULAR MODE for continuous sampling
+     * ================================================================
+     * CRITICAL: DMA_CIRCULAR allows ADC to run continuously
+     * without stopping. When buffer is full, DMA wraps around
+     * to the beginning automatically.
+     *
+     * Half Complete IRQ: First half ready, ADC fills second half
+     * Complete IRQ: Second half ready, ADC wraps to first half
+     *
+     * Result: ZERO dead time, continuous data stream
+     * ================================================================ */
     hdma_adc1.Instance = DMA1_Channel1;
     hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;
     hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;
     hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;
     hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
     hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
-    hdma_adc1.Init.Mode = DMA_NORMAL;
+    hdma_adc1.Init.Mode = DMA_CIRCULAR;  // ← CIRCULAR for continuous ADC!
     hdma_adc1.Init.Priority = DMA_PRIORITY_VERY_HIGH;
     HAL_DMA_Init(&hdma_adc1);
 
@@ -69,15 +81,21 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* SPI1 DMA TX - CIRCULAR MODE! */
+    /* ================================================================
+     * SPI1 DMA TX - NORMAL MODE for packet transmission
+     * ================================================================
+     * SPI uses NORMAL mode because each packet is a discrete
+     * transmission. After sending one packet, we switch to
+     * the other TX buffer (ping-pong).
+     * ================================================================ */
     hdma_spi1_tx.Instance = DMA1_Channel3;
     hdma_spi1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
     hdma_spi1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
     hdma_spi1_tx.Init.MemInc = DMA_MINC_ENABLE;
     hdma_spi1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     hdma_spi1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
-    hdma_spi1_tx.Init.Mode = DMA_CIRCULAR;  // ← CIRCULAR!
-    hdma_spi1_tx.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_spi1_tx.Init.Mode = DMA_NORMAL;  // ← NORMAL for discrete packets
+    hdma_spi1_tx.Init.Priority = DMA_PRIORITY_HIGH;  // Higher priority for timely transmission
     HAL_DMA_Init(&hdma_spi1_tx);
 
     __HAL_LINKDMA(hspi, hdmatx, hdma_spi1_tx);
