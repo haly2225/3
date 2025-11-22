@@ -287,10 +287,12 @@ static void MX_ADC1_Init(void)
         Error_Handler();
     }
 
-    // Channel 8 (PB0) with fast sampling
+    // Channel 8 (PB0) with balanced sampling
+    // ADC clock = 10.67MHz, with 28.5 cycles: 10.67MHz / (12.5 + 28.5) = ~260kSps
+    // This gives Pi enough time to read data before buffer overrun
     sConfig.Channel = ADC_CHANNEL_8;
     sConfig.Rank = ADC_REGULAR_RANK_1;
-    sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;  // ~600kHz sample rate
+    sConfig.SamplingTime = ADC_SAMPLETIME_28CYCLES_5;  // ~260kHz sample rate (balanced for SPI)
 
     if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
         Error_Handler();
