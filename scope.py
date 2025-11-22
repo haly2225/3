@@ -431,14 +431,20 @@ class SPIReader:
             return None
 
     def parse_packet(self, samples):
-        """Parse ADC samples to voltages"""
+        """Parse ADC samples to voltages
+
+        IMPORTANT: "Lưu Thô - Xử lý Tinh" principle
+        This function ONLY converts ADC -> Voltage.
+        NO TRIGGER processing here to keep raw data intact for memory.
+        Trigger is applied later in get_triggered_data() for display.
+        """
         if not samples or len(samples) == 0:
             return [], []
 
-        # Convert to volts
+        # Convert to volts (RAW - no trigger processing)
         voltages = [(x * VCC / ADC_MAX) for x in samples]
 
-        # Calculate Vpp, Vmax, Vmin
+        # Calculate Vpp, Vmax, Vmin for debug stats
         vmax = max(voltages)
         vmin = min(voltages)
         vpp = vmax - vmin
@@ -447,9 +453,6 @@ class SPIReader:
         self.vmax_latest = vmax
         self.vmin_latest = vmin
         self.vpp_latest = vpp
-
-        # Calculate frequency (count zero crossings)
-        self.frequency_latest = self.calculate_frequency(voltages)
 
         # Detect signal clipping (touching ADC limits)
         is_clipped = (vmax >= 3.25) or (vmin <= 0.05)
@@ -462,7 +465,7 @@ class SPIReader:
                 print(f"⚠️  SIGNAL CLIPPING: Vmax={vmax:.2f}V, Vmin={vmin:.2f}V")
                 print(f"    💡 Tip: Use voltage divider (2 resistors) to reduce signal to 0.5V-2.5V range")
 
-        # Auto Trigger 50%
+        # Auto Trigger 50% - update trigger level based on signal
         if self.auto_trigger_50 and vpp > 0.5:
             self.last_vmax = vmax
             self.last_vmin = vmin
@@ -472,27 +475,11 @@ class SPIReader:
                 clip_warn = " ⚠️ CLIPPED" if is_clipped else ""
                 print(f"🎯 Auto 50%: {mid_level:.2f}V (Vmax={vmax:.2f}V, Vmin={vmin:.2f}V){clip_warn}")
 
-        # Find trigger edge
-        edge_idx = self.find_trigger_edge(voltages)
+        # Generate time array (relative)
+        times = [i / SAMPLE_RATE for i in range(len(voltages))]
 
-        if edge_idx >= 0:
-            self.trigger_found_count += 1
-
-            # Phase-locked alignment
-            shift = self.edge_index - edge_idx
-            self.shift_samples = shift
-
-            # Shift waveform
-            shifted_voltages = self.shift_waveform(voltages, shift)
-
-            # Generate time array
-            times = [i / SAMPLE_RATE for i in range(len(shifted_voltages))]
-
-            return shifted_voltages, times
-        else:
-            # No trigger found (free run)
-            times = [i / SAMPLE_RATE for i in range(len(voltages))]
-            return voltages, times
+        # Return RAW voltages - NO trigger shift applied
+        return voltages, times
 
     def calculate_frequency(self, voltages):
         """Calculate frequency from zero crossings with IMPROVED accuracy
@@ -1023,6 +1010,114 @@ class SPIReader:
 
             return voltages, times
 
+    # =====================================================
+    # TRIGGER ON OUTPUT - "Xử lý Tinh" (Apply trigger when displaying)
+    # =====================================================
+
+    def find_stable_trigger(self, data):
+        """Find stable trigger point in data (Rising/Falling Edge)
+
+        This is called when displaying data, NOT when storing.
+        Returns index of trigger point, or -1 if not found.
+        """
+        if len(data) < 20:
+            return -1
+
+        level = self.trigger_level
+
+        # Hysteresis to prevent noise triggering
+        # Scale with signal amplitude
+        hysteresis = 0.1 if (self.vpp_latest > 0.5) else 0.02
+
+        # Only scan first 1/3 of data to ensure enough data after trigger
+        # This ensures we have full waveform to display after trigger point
+        scan_limit = len(data) // 3
+
+        if self.trigger_slope == TriggerSlope.RISING:
+            # Rising Edge: LOW -> crosses trigger level -> HIGH
+            for i in range(1, scan_limit):
+                if (data[i-1] < level - hysteresis) and (data[i] >= level):
+                    return i  # Found rising edge!
+        else:
+            # Falling Edge: HIGH -> crosses trigger level -> LOW
+            for i in range(1, scan_limit):
+                if (data[i-1] > level + hysteresis) and (data[i] <= level):
+                    return i  # Found falling edge!
+
+        return -1  # No trigger found
+
+    def get_triggered_data(self, num_points=1000):
+        """Get data from memory WITH TRIGGER applied for stable display
+
+        "Xử lý Tinh" - Apply trigger when getting data for display.
+        This keeps waveform locked to trigger point, preventing drift.
+
+        Args:
+            num_points: Number of samples to return for display
+
+        Returns:
+            (voltages, times) tuple with trigger-locked data
+        """
+        with self.lock:
+            mem_len = len(self.memory)
+
+            # Need at least 2x display points for search window
+            if mem_len < num_points * 2:
+                return [], []
+
+            # 1. Get a WIDER window than needed (1.5x) for trigger search
+            search_window = int(num_points * 1.5)
+
+            # Calculate position based on scroll offset
+            end_idx = mem_len - self.scroll_offset
+            start_idx = end_idx - search_window
+
+            # Clamp to valid range
+            if start_idx < 0:
+                start_idx = 0
+            if end_idx > mem_len:
+                end_idx = mem_len
+            if end_idx <= start_idx:
+                return [], []
+
+            # Extract raw data from ring buffer
+            mem_list = list(self.memory)
+            raw_data = mem_list[start_idx:end_idx]
+
+            if not raw_data:
+                return [], []
+
+            # 2. Find trigger point (only if not FREE_RUN mode)
+            trigger_offset = 0
+            if self.trigger_mode != TriggerMode.FREE_RUN:
+                trigger_offset = self.find_stable_trigger(raw_data)
+
+            # 3. Extract display data based on trigger
+            display_data = []
+
+            if trigger_offset >= 0:
+                # Trigger found: Start display from trigger point
+                available = len(raw_data) - trigger_offset
+                take = min(available, num_points)
+                display_data = raw_data[trigger_offset:trigger_offset + take]
+                self.trigger_found_count += 1
+            else:
+                # No trigger: Show most recent data (prevents black screen)
+                # In NORMAL mode, could hold last triggered frame instead
+                start_view = len(raw_data) - num_points
+                if start_view < 0:
+                    start_view = 0
+                display_data = raw_data[start_view:]
+
+            # Generate time array
+            times = [i / SAMPLE_RATE for i in range(len(display_data))]
+
+            # Calculate frequency on triggered (stable) data
+            if len(display_data) > 10:
+                self.frequency_latest = self.calculate_frequency(display_data)
+
+            return display_data, times
+
     def set_trigger_mode(self, mode):
         """Set trigger mode"""
         self.trigger_mode = mode
@@ -1521,18 +1616,27 @@ class MainWindow(QWidget):
         main_layout.addWidget(self.panel)
 
     def update_display(self):
-        """Update display with new data"""
-        # Check if we're in live view or scroll/pause mode
-        mem_info = self.reader.get_memory_info()
+        """Update display with TRIGGERED data
 
-        if mem_info['is_live'] and mem_info['samples_to_display'] <= 512:
-            # LIVE MODE with small zoom: Use single packet (512 samples)
-            # to avoid stitching artifacts (no data gaps)
-            voltages, times = self.reader.get_data()
-        else:
-            # SCROLL/PAUSE MODE or ZOOM OUT: Use memory buffer
-            # Uses get_display_data with automatic downsampling for "Full sóng"
+        "Lưu Thô - Xử lý Tinh" principle:
+        - Raw data is stored in memory (by reader_loop)
+        - Trigger is applied HERE when displaying (get_triggered_data)
+        - This prevents waveform drift!
+        """
+        mem_info = self.reader.get_memory_info()
+        points_needed = self.reader.samples_to_display
+
+        # Choose display method based on zoom level:
+        # - Zoom IN (detail): Use get_triggered_data() for stable waveform
+        # - Zoom OUT (full wave): Use get_display_data() with downsampling
+        if points_needed > 5000:
+            # FULL WAVE MODE (Roll mode) - show overview with downsampling
+            # No trigger needed for full wave view
             voltages, times = self.reader.get_display_data(max_points=1000)
+        else:
+            # DETAIL MODE - use trigger for stable waveform
+            # This is the key change: apply trigger when displaying!
+            voltages, times = self.reader.get_triggered_data(num_points=points_needed)
 
         if len(voltages) > 0:
             self.display.set_data(voltages, times)
