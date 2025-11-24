@@ -21,6 +21,7 @@ import time
 import struct
 import threading
 from collections import deque
+from itertools import islice
 from enum import Enum
 from datetime import datetime
 import math
@@ -814,9 +815,8 @@ class SPIReader:
             if start_idx >= end_idx:
                 return [], []
 
-            # Extract slice from deque (convert to list first)
-            mem_list = list(self.memory)
-            voltages = mem_list[start_idx:end_idx]
+            # Extract slice from deque EFFICIENTLY using islice
+            voltages = list(islice(self.memory, start_idx, end_idx))
 
             # Generate relative time array
             times = [i / SAMPLE_RATE for i in range(len(voltages))]
@@ -1000,9 +1000,8 @@ class SPIReader:
             if start_idx >= end_idx:
                 return [], []
 
-            # Extract data from ring buffer
-            mem_list = list(self.memory)
-            raw_voltages = mem_list[start_idx:end_idx]
+            # Extract data from ring buffer EFFICIENTLY using islice
+            raw_voltages = list(islice(self.memory, start_idx, end_idx))
 
             # Apply downsampling if needed (for "Full sóng")
             if len(raw_voltages) > max_points:
@@ -1163,9 +1162,9 @@ class SPIReader:
                     return self.last_triggered_data, self.last_triggered_times
                 return [], []
 
-            # Extract raw data from ring buffer
-            mem_list = list(self.memory)
-            raw_data = mem_list[start_idx:end_idx]
+            # Extract raw data from ring buffer EFFICIENTLY
+            # Use islice to avoid copying entire 500K deque (huge performance gain!)
+            raw_data = list(islice(self.memory, start_idx, end_idx))
 
             if not raw_data:
                 if self.last_triggered_data:
@@ -1229,8 +1228,8 @@ class SPIReader:
                 self.trigger_hold_count += 1
 
                 if self.trigger_mode == TriggerMode.AUTO:
-                    # AUTO MODE: Hold for more frames (10 = 500ms at 20FPS)
-                    if self.trigger_hold_count <= 10 and self.last_triggered_data:
+                    # AUTO MODE: Hold for more frames (20 = 1s at 20FPS)
+                    if self.trigger_hold_count <= 20 and self.last_triggered_data:
                         # Hold last triggered frame to prevent jitter
                         return self.last_triggered_data, self.last_triggered_times
                     else:
