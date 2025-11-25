@@ -472,14 +472,18 @@ class SPIReader:
                 print(f"    💡 Tip: Use voltage divider (2 resistors) to reduce signal to 0.5V-2.5V range")
 
         # Auto Trigger 50% - update trigger level based on signal
-        if self.auto_trigger_50 and vpp > 0.5:
+        # IMPROVED: More aggressive updates, lower Vpp threshold
+        if self.auto_trigger_50 and vpp > 0.2:  # Lower threshold: 0.2V instead of 0.5V
             self.last_vmax = vmax
             self.last_vmin = vmin
             mid_level = (vmax + vmin) / 2.0
-            if abs(mid_level - self.trigger_level) > 0.02:
+
+            # More aggressive update: 0.01V threshold instead of 0.02V
+            # This makes trigger track signal changes faster!
+            if abs(mid_level - self.trigger_level) > 0.01:
                 self.trigger_level = mid_level
                 clip_warn = " ⚠️ CLIPPED" if is_clipped else ""
-                print(f"🎯 Auto 50%: {mid_level:.2f}V (Vmax={vmax:.2f}V, Vmin={vmin:.2f}V){clip_warn}")
+                print(f"🎯 Auto 50%: {mid_level:.2f}V (Vpp={vpp:.2f}V, Vmax={vmax:.2f}V, Vmin={vmin:.2f}V){clip_warn}")
 
         # Generate time array (relative)
         times = [i / SAMPLE_RATE for i in range(len(voltages))]
@@ -507,8 +511,9 @@ class SPIReader:
         # Detect clipping (signal touches ADC limits)
         is_clipped = (vmax >= 3.25) or (vmin <= 0.05)
 
-        # Filter out noise: signal must have at least 300mV amplitude
-        if vpp < 0.3:
+        # Filter out noise: signal must have at least 150mV amplitude
+        # IMPROVED: Lower threshold from 0.3V to 0.15V to detect weaker signals
+        if vpp < 0.15:
             return 0.0
 
         # ADAPTIVE parameters based on clipping detection
@@ -1036,13 +1041,15 @@ class SPIReader:
         # ADAPTIVE HYSTERESIS based on signal characteristics
         is_clipped = (self.vmax_latest >= 3.25) or (self.vmin_latest <= 0.05)
         if is_clipped:
-            # Clipped signal: Use 12% of Vpp, minimum 0.25V (reduced from 15%/0.3V)
-            hysteresis = max(0.25, vpp * 0.12)
-            min_stable_samples = 10  # Reduced from 15 for more triggers
+            # Clipped signal: Use 10% of Vpp, minimum 0.20V
+            # IMPROVED: More sensitive for better trigger on different signal levels
+            hysteresis = max(0.20, vpp * 0.10)
+            min_stable_samples = 8  # Reduced from 10 for faster trigger
         else:
-            # Normal signal: Use 8% of Vpp, minimum 0.08V
-            hysteresis = max(0.08, vpp * 0.08)
-            min_stable_samples = 4
+            # Normal signal: Use 6% of Vpp, minimum 0.06V
+            # IMPROVED: More sensitive for weaker signals
+            hysteresis = max(0.06, vpp * 0.06)
+            min_stable_samples = 3  # Reduced from 4
 
         # Scan first 40% of data (leave 60% for display after trigger)
         scan_limit = int(len(data) * 0.4)
@@ -1199,10 +1206,23 @@ class SPIReader:
                 # Generate time array
                 times = [i / SAMPLE_RATE for i in range(len(display_data))]
 
-                # Calculate frequency on triggered (stable) data FIRST
-                # This is critical - calculate before any potential modifications
-                if len(display_data) > 10:
-                    self.frequency_latest = self.calculate_frequency(display_data)
+                # Calculate frequency on LARGER FIXED WINDOW for accuracy
+                # CRITICAL FIX: Always use 4K-8K samples for frequency calculation,
+                # regardless of zoom level. Small windows (256-1K samples) don't have
+                # enough cycles for accurate frequency measurement!
+                FREQ_CALC_WINDOW = 4096  # Fixed 4K samples for frequency (~15ms)
+                freq_end_idx = mem_len - self.scroll_offset
+                freq_start_idx = freq_end_idx - FREQ_CALC_WINDOW
+
+                if freq_start_idx >= 0 and freq_end_idx <= mem_len:
+                    # Extract 4K samples from memory for frequency calculation
+                    freq_data = list(islice(self.memory, freq_start_idx, freq_end_idx))
+                    if len(freq_data) >= 2000:  # Need at least 2K samples
+                        self.frequency_latest = self.calculate_frequency(freq_data)
+                else:
+                    # Fallback: use raw_data if 4K window not available
+                    if len(raw_data) >= 1000:
+                        self.frequency_latest = self.calculate_frequency(raw_data)
 
                 # SAVE as last triggered frame (for hold feature)
                 self.last_triggered_data = list(display_data)
