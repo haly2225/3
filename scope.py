@@ -709,7 +709,9 @@ class SPIReader:
                     # FIX: SMOOTH the transition to prevent trigger instability!
                     if voltage_jump > 0.5:
                         stitch_glitches += 1
-                        self.glitch_cooldown = 3  # Wait 3 frames (~150ms) before accepting trigger
+                        # IMPROVED: 1 frame cooldown (50ms) instead of 3 frames (150ms)
+                        # With 28 glitches/second, 3-frame cooldown never expired!
+                        self.glitch_cooldown = 1
 
                         # CRITICAL FIX: Smooth the first few samples to bridge the gap
                         # This prevents trigger from seeing sudden jumps as signal edges
