@@ -378,6 +378,9 @@ class SPIReader:
         self.last_triggered_times = []
         self.trigger_hold_count = 0  # Count frames held without new trigger
 
+        # GLITCH HANDLING - prevent triggering on corrupted data
+        self.glitch_cooldown = 0  # Frames to wait after glitch before accepting trigger
+
         # Debug stats
         self.packet_count = 0
         self.sync_ok_count = 0
@@ -696,14 +699,27 @@ class SPIReader:
                 voltages, times = self.parse_packet(samples)
 
                 # =====================================================
-                # DATA STITCHING DETECTION
+                # DATA STITCHING DETECTION & REPAIR
                 # =====================================================
                 # Detect voltage discontinuity at packet boundary
                 if last_packet_end_voltage is not None and len(voltages) > 0:
                     voltage_jump = abs(voltages[0] - last_packet_end_voltage)
+
                     # If jump > 0.5V, likely a stitching artifact
+                    # FIX: SMOOTH the transition to prevent trigger instability!
                     if voltage_jump > 0.5:
                         stitch_glitches += 1
+                        self.glitch_cooldown = 3  # Wait 3 frames (~150ms) before accepting trigger
+
+                        # CRITICAL FIX: Smooth the first few samples to bridge the gap
+                        # This prevents trigger from seeing sudden jumps as signal edges
+                        SMOOTH_SAMPLES = min(8, len(voltages))  # Smooth first 8 samples
+
+                        for i in range(SMOOTH_SAMPLES):
+                            # Linear interpolation from last_packet to current packet
+                            blend = i / SMOOTH_SAMPLES  # 0.0 → 1.0
+                            original = voltages[i]
+                            voltages[i] = last_packet_end_voltage * (1 - blend) + original * blend
 
                 # Track packet timing (dead time detection)
                 packet_interval = (packet_start_time - last_packet_time) * 1000  # ms
@@ -1181,7 +1197,13 @@ class SPIReader:
             # 2. Find trigger point (only if not FREE_RUN mode)
             trigger_offset = -1
             if self.trigger_mode != TriggerMode.FREE_RUN:
-                trigger_offset = self.find_stable_trigger(raw_data)
+                # GLITCH HANDLING: Don't trigger immediately after glitch
+                # Wait for cooldown to expire to ensure clean data
+                if self.glitch_cooldown > 0:
+                    self.glitch_cooldown -= 1
+                    trigger_offset = -1  # Force hold-last-frame during cooldown
+                else:
+                    trigger_offset = self.find_stable_trigger(raw_data)
 
             # 3. Extract display data based on trigger
             if trigger_offset >= 0:
