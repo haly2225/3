@@ -706,22 +706,13 @@ class SPIReader:
                     voltage_jump = abs(voltages[0] - last_packet_end_voltage)
 
                     # If jump > 0.5V, likely a stitching artifact
-                    # FIX: SMOOTH the transition to prevent trigger instability!
+                    # CRITICAL FIX: Don't smooth - it creates fake edges that confuse trigger!
+                    # Just mark as glitch and set cooldown flag
                     if voltage_jump > 0.5:
                         stitch_glitches += 1
-                        # IMPROVED: 1 frame cooldown (50ms) instead of 3 frames (150ms)
-                        # With 28 glitches/second, 3-frame cooldown never expired!
+                        # Set cooldown to 1 frame - no trigger on this frame
                         self.glitch_cooldown = 1
-
-                        # CRITICAL FIX: Smooth the first few samples to bridge the gap
-                        # This prevents trigger from seeing sudden jumps as signal edges
-                        SMOOTH_SAMPLES = min(8, len(voltages))  # Smooth first 8 samples
-
-                        for i in range(SMOOTH_SAMPLES):
-                            # Linear interpolation from last_packet to current packet
-                            blend = i / SMOOTH_SAMPLES  # 0.0 → 1.0
-                            original = voltages[i]
-                            voltages[i] = last_packet_end_voltage * (1 - blend) + original * blend
+                        # NO SMOOTHING - smoothing creates fake edges that trigger locks onto!
 
                 # Track packet timing (dead time detection)
                 packet_interval = (packet_start_time - last_packet_time) * 1000  # ms
