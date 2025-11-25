@@ -1179,11 +1179,11 @@ class SPIReader:
             # 3. Extract display data based on trigger
             if trigger_offset >= 0:
                 # TRIGGER FOUND: Start display from trigger point
-                # trigger_offset can be float (sub-sample interpolation)
-                int_offset = int(trigger_offset)
-                frac_offset = trigger_offset - int_offset
+                # trigger_offset can be float (sub-sample position)
+                # For clipped square waves, use integer position (no interpolation benefit)
+                int_offset = int(trigger_offset + 0.5)  # Round to nearest
 
-                available = len(raw_data) - int_offset - 1  # -1 for interpolation
+                available = len(raw_data) - int_offset
                 take = min(available, num_points)
 
                 if take <= 0:
@@ -1191,36 +1191,24 @@ class SPIReader:
                         return self.last_triggered_data, self.last_triggered_times
                     return [], []
 
-                # Extract data with SUB-SAMPLE shift using linear interpolation
-                if frac_offset > 0.01 and int_offset + take + 1 <= len(raw_data):
-                    # Interpolate each sample to shift by fractional amount
-                    display_data = []
-                    for j in range(take):
-                        idx = int_offset + j
-                        if idx + 1 < len(raw_data):
-                            # Linear interpolation: v = v0 + frac * (v1 - v0)
-                            v0 = raw_data[idx]
-                            v1 = raw_data[idx + 1]
-                            v = v0 + frac_offset * (v1 - v0)
-                            display_data.append(v)
-                        else:
-                            display_data.append(raw_data[idx])
-                else:
-                    # No fractional shift needed
-                    display_data = raw_data[int_offset:int_offset + take]
+                # Extract data directly (no sub-sample interpolation)
+                # For clipped square waves (0V-3.3V), interpolation doesn't help
+                # and can actually smooth out sharp edges, breaking frequency detection
+                display_data = raw_data[int_offset:int_offset + take]
 
-                # Generate time array (shift by fractional offset)
-                times = [(i - frac_offset) / SAMPLE_RATE for i in range(len(display_data))]
+                # Generate time array
+                times = [i / SAMPLE_RATE for i in range(len(display_data))]
+
+                # Calculate frequency on triggered (stable) data FIRST
+                # This is critical - calculate before any potential modifications
+                if len(display_data) > 10:
+                    self.frequency_latest = self.calculate_frequency(display_data)
 
                 # SAVE as last triggered frame (for hold feature)
                 self.last_triggered_data = list(display_data)
                 self.last_triggered_times = list(times)
                 self.trigger_hold_count = 0
                 self.trigger_found_count += 1
-
-                # Calculate frequency on triggered (stable) data
-                if len(display_data) > 10:
-                    self.frequency_latest = self.calculate_frequency(display_data)
 
                 return display_data, times
             else:
