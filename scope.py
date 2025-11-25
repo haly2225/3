@@ -1050,15 +1050,14 @@ class SPIReader:
         # ADAPTIVE HYSTERESIS based on signal characteristics
         is_clipped = (self.vmax_latest >= 3.25) or (self.vmin_latest <= 0.05)
         if is_clipped:
-            # Clipped signal: Use 10% of Vpp, minimum 0.20V
-            # IMPROVED: More sensitive for better trigger on different signal levels
-            hysteresis = max(0.20, vpp * 0.10)
-            min_stable_samples = 8  # Reduced from 10 for faster trigger
+            # Clipped signal: VERY RELAXED for poor data quality
+            # With 131 glitches/5s, need minimal requirements!
+            hysteresis = max(0.15, vpp * 0.08)  # Was 0.20V, now 0.15V
+            min_stable_samples = 3  # Was 8, now 3! Much more lenient
         else:
-            # Normal signal: Use 6% of Vpp, minimum 0.06V
-            # IMPROVED: More sensitive for weaker signals
-            hysteresis = max(0.06, vpp * 0.06)
-            min_stable_samples = 3  # Reduced from 4
+            # Normal signal: Also relaxed
+            hysteresis = max(0.05, vpp * 0.05)  # Was 0.06V
+            min_stable_samples = 2  # Was 3
 
         # Scan first 40% of data (leave 60% for display after trigger)
         scan_limit = int(len(data) * 0.4)
