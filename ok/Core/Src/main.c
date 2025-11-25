@@ -127,6 +127,9 @@ int main(void)
       /* Pack data into SPI buffer */
       pack_buffer();
 
+      /* Restart SPI DMA transmission with new data */
+      HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
+
       /* Restart ADC DMA */
       HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, BUFFER_SIZE);
 
