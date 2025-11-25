@@ -45,8 +45,8 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
+extern DMA_HandleTypeDef hdma_adc1;
 extern DMA_HandleTypeDef hdma_spi1_tx;
-extern volatile uint8_t conversion_ready;
 /* USER CODE BEGIN EV */
 /* USER CODE END EV */
 
@@ -178,19 +178,13 @@ void SysTick_Handler(void)
 
 /**
   * @brief This function handles DMA1 channel1 global interrupt.
-  * @note  This is for ADC1 DMA transfer complete (dual ADC mode)
+  * @note  This is for ADC1 DMA transfer complete
   */
 void DMA1_Channel1_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA1_Channel1_IRQn 0 */
-  LL_TIM_DisableCounter(TIM3);  // Stop ADC triggering
-
-  if (LL_DMA_IsActiveFlag_TC1(DMA1))
-  {
-    LL_DMA_ClearFlag_TC1(DMA1);
-    conversion_ready = 1;  // Signal main loop that data is ready
-  }
   /* USER CODE END DMA1_Channel1_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_adc1);
   /* USER CODE BEGIN DMA1_Channel1_IRQn 1 */
   /* USER CODE END DMA1_Channel1_IRQn 1 */
 }
