@@ -1190,13 +1190,10 @@ class SPIReader:
             # 2. Find trigger point (only if not FREE_RUN mode)
             trigger_offset = -1
             if self.trigger_mode != TriggerMode.FREE_RUN:
-                # GLITCH HANDLING: Don't trigger immediately after glitch
-                # Wait for cooldown to expire to ensure clean data
-                if self.glitch_cooldown > 0:
-                    self.glitch_cooldown -= 1
-                    trigger_offset = -1  # Force hold-last-frame during cooldown
-                else:
-                    trigger_offset = self.find_stable_trigger(raw_data)
+                # SIMPLIFIED: No cooldown - let trigger work naturally!
+                # The state machine in find_stable_trigger() is robust enough
+                # to distinguish real edges from glitches
+                trigger_offset = self.find_stable_trigger(raw_data)
 
             # 3. Extract display data based on trigger
             if trigger_offset >= 0:
