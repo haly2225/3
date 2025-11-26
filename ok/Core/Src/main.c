@@ -55,15 +55,39 @@ void pack_buffer(void)
   tx_buffer[2] = (frame_counter >> 8) & 0xFF;
   tx_buffer[3] = frame_counter & 0xFF;
 
-  // TEST MODE: Generate sawtooth wave pattern to verify SPI transmission
-  // If you see this pattern on Pi4, SPI is working! Then we can debug ADC.
+  // Use REAL ADC data
   for (uint16_t i = 0; i < BUFFER_SIZE; i++) {
-    // Sawtooth: 0 to 4095 (12-bit ADC range)
-    uint16_t val = (i * 8) & 0x0FFF;  // Repeating sawtooth pattern
-    // Uncomment below line to use real ADC data after SPI test passes:
-    // uint16_t val = adc_buffer[i];
+    uint16_t val = adc_buffer[i];  // Real ADC from PA0
     tx_buffer[4 + i*2] = (val >> 8) & 0xFF;
     tx_buffer[4 + i*2 + 1] = val & 0xFF;
+  }
+
+  // LED DEBUG: Show ADC average on LED
+  // Calculate average of first 100 samples
+  uint32_t sum = 0;
+  for (int i = 0; i < 100; i++) {
+    sum += adc_buffer[i];
+  }
+  uint16_t avg = sum / 100;
+
+  // Blink LED based on ADC value:
+  // 0-2047: LED ON long (low voltage)
+  // 2048-4095: LED ON short (high voltage)
+  static uint8_t led_state = 0;
+  if (avg < 2048) {
+    // Low voltage: slow blink
+    if ((frame_counter % 100) < 80) {
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  // LED ON
+    } else {
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);    // LED OFF
+    }
+  } else {
+    // High voltage: fast blink
+    if ((frame_counter % 20) < 10) {
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  // LED ON
+    } else {
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);    // LED OFF
+    }
   }
 
   frame_counter++;
@@ -161,8 +185,7 @@ int main(void)
       /* Restart timer */
       HAL_TIM_Base_Start(&htim3);
 
-      /* Toggle LED to show activity */
-      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+      /* LED debug is handled in pack_buffer() */
     }
   }
 }
