@@ -29,7 +29,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
-// UART_HandleTypeDef huart1;  // UART disabled - need to add driver files first
+TIM_HandleTypeDef htim2;  // PWM 1kHz for test signal
 TIM_HandleTypeDef htim3;
 
 uint16_t adc_buffer[BUFFER_SIZE] __attribute__((aligned(4)));
@@ -37,7 +37,6 @@ uint8_t  tx_buffer[TX_BYTES] __attribute__((aligned(4)));
 
 volatile uint16_t frame_counter = 0;
 volatile uint8_t conversion_ready = 0;
-// volatile uint8_t uart_tx_busy = 0;  // UART disabled
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -45,7 +44,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI1_Init(void);
-// static void MX_USART1_UART_Init(void);  // UART disabled
+static void MX_TIM2_Init(void);  // 1kHz PWM test signal
 static void MX_TIM3_Init(void);
 
 /* Pack buffer for SPI transmission */
@@ -105,8 +104,11 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_SPI1_Init();
-  // MX_USART1_UART_Init();  // UART disabled - need driver files
+  MX_TIM2_Init();  // 1kHz PWM test signal on PA1
   MX_TIM3_Init();
+
+  /* Start PWM test signal */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);  // PA1 = TIM2_CH2
 
   /* ADC Calibration */
   HAL_ADCEx_Calibration_Start(&hadc1);
@@ -289,6 +291,59 @@ static void MX_USART1_UART_Init(void)
 */
 
 /**
+  * @brief TIM2 Initialization Function - 1kHz PWM Test Signal
+  * @note Generates 1kHz square wave on PA1 (TIM2_CH2) for ADC testing
+  * @note Connect PA1 to PA0 to test ADC
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  // TIM2 clock = 64 MHz
+  // For 1kHz: Prescaler=63, Period=999 → 64MHz/(64*1000) = 1kHz
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 63;           // 64MHz / 64 = 1MHz
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;             // 1MHz / 1000 = 1kHz
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // PWM output on Channel 2 (PA1)
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 500;  // 50% duty cycle
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief TIM3 Initialization Function
   * @note Timer configured for ~600kHz ADC trigger
   */
@@ -358,12 +413,19 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
 
-  /*Configure GPIO pin : PC13 */
+  /*Configure GPIO pin : PC13 (LED) */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA1 (TIM2_CH2 PWM - 1kHz test signal) */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 /**
