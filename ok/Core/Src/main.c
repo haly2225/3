@@ -249,14 +249,16 @@ static void MX_ADC1_Init(void)
   */
 static void MX_SPI1_Init(void)
 {
-  /* SPI1 parameter configuration*/
+  /* SPI1 parameter configuration - MASTER MODE */
+  /* STM32 generates clock and sends data independently */
   hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_SLAVE;
+  hspi1.Init.Mode = SPI_MODE_MASTER;  // Changed to MASTER
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_HARD_INPUT;
+  hspi1.Init.NSS = SPI_NSS_SOFT;  // Software NSS control
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;  // 64MHz/8 = 8MHz
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
