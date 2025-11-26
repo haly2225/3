@@ -145,13 +145,21 @@ int main(void)
     HAL_Delay(100);
   }
 
-  /* Initialize buffers */
+  /* Initialize buffers with test pattern */
   memset(adc_buffer, 0, sizeof(adc_buffer));
-  pack_buffer();
 
-  /* Start SPI DMA transmission */
+  // Fill buffer with recognizable test pattern
+  tx_buffer[0] = 0xAA;
+  tx_buffer[1] = 0x55;
+  tx_buffer[2] = 0x12;
+  tx_buffer[3] = 0x34;
+  for (int i = 4; i < TX_BYTES; i++) {
+    tx_buffer[i] = i & 0xFF;  // Simple incrementing pattern
+  }
+
+  /* Start SPI slave - ready to transmit when master clocks */
   HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
-  HAL_Delay(10);
+  HAL_Delay(100);  // Give DMA time to setup
 
   /* Start ADC DMA */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, BUFFER_SIZE);
@@ -183,8 +191,9 @@ int main(void)
     }
 
     // Keep SPI buffer fresh: restart transmission every 50ms
-    // This ensures data is always ready when Pi4 reads
+    // Update test pattern to verify transmission
     if (HAL_GetTick() - spi_refresh >= 50) {
+      tx_buffer[3]++;  // Increment counter byte to see changes
       HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
       spi_refresh = HAL_GetTick();
     }
