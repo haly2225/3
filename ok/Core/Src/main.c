@@ -170,6 +170,7 @@ int main(void)
 
   /* Infinite loop */
   uint32_t led_heartbeat = HAL_GetTick();
+  uint32_t spi_refresh = HAL_GetTick();
   uint8_t led_state = 0;
 
   while (1)
@@ -181,6 +182,13 @@ int main(void)
       led_heartbeat = HAL_GetTick();
     }
 
+    // Keep SPI buffer fresh: restart transmission every 50ms
+    // This ensures data is always ready when Pi4 reads
+    if (HAL_GetTick() - spi_refresh >= 50) {
+      HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
+      spi_refresh = HAL_GetTick();
+    }
+
     if (conversion_ready) {  // UART check removed
       conversion_ready = 0;
 
@@ -190,9 +198,6 @@ int main(void)
       /* Send via UART - DISABLED (need driver files) */
       // uart_tx_busy = 1;
       // HAL_UART_Transmit_IT(&huart1, tx_buffer, TX_BYTES);
-
-      /* Send via SPI */
-      HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
 
       /* Restart ADC DMA */
       HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, BUFFER_SIZE);
@@ -287,16 +292,16 @@ static void MX_ADC1_Init(void)
   */
 static void MX_SPI1_Init(void)
 {
-  /* SPI1 parameter configuration - MASTER MODE */
-  /* STM32 generates clock and sends data independently */
+  /* SPI1 parameter configuration - SLAVE MODE */
+  /* Pi4 is master, STM32 responds to clock from Pi4 */
   hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;  // Changed to MASTER
+  hspi1.Init.Mode = SPI_MODE_SLAVE;  // STM32 is slave
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
   hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;  // Software NSS control
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;  // 64MHz/8 = 8MHz
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;  // Not used in slave mode
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
