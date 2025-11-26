@@ -33,3 +33,6 @@ Release/
 # OS
 .DS_Store
 Thumbs.db
+
+# Reference files
+VanAn_main.c
