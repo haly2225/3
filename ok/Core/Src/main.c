@@ -73,7 +73,6 @@ void pack_buffer(void)
   // Blink LED based on ADC value:
   // 0-2047: LED ON long (low voltage)
   // 2048-4095: LED ON short (high voltage)
-  static uint8_t led_state = 0;
   if (avg < 2048) {
     // Low voltage: slow blink
     if ((frame_counter % 100) < 80) {
