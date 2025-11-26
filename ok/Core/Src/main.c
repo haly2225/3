@@ -29,6 +29,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
+UART_HandleTypeDef huart1;  // Add UART for simpler communication
 TIM_HandleTypeDef htim3;
 
 uint16_t adc_buffer[BUFFER_SIZE] __attribute__((aligned(4)));
@@ -36,6 +37,7 @@ uint8_t  tx_buffer[TX_BYTES] __attribute__((aligned(4)));
 
 volatile uint16_t frame_counter = 0;
 volatile uint8_t conversion_ready = 0;
+volatile uint8_t uart_tx_busy = 0;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -43,6 +45,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
 static void MX_TIM3_Init(void);
 
 /* Pack buffer for SPI transmission */
@@ -53,8 +56,13 @@ void pack_buffer(void)
   tx_buffer[2] = (frame_counter >> 8) & 0xFF;
   tx_buffer[3] = frame_counter & 0xFF;
 
+  // TEST MODE: Generate sawtooth wave pattern to verify SPI transmission
+  // If you see this pattern on Pi4, SPI is working! Then we can debug ADC.
   for (uint16_t i = 0; i < BUFFER_SIZE; i++) {
-    uint16_t val = adc_buffer[i];
+    // Sawtooth: 0 to 4095 (12-bit ADC range)
+    uint16_t val = (i * 8) & 0x0FFF;  // Repeating sawtooth pattern
+    // Uncomment below line to use real ADC data after SPI test passes:
+    // uint16_t val = adc_buffer[i];
     tx_buffer[4 + i*2] = (val >> 8) & 0xFF;
     tx_buffer[4 + i*2 + 1] = val & 0xFF;
   }
@@ -68,6 +76,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   if (hadc->Instance == ADC1) {
     HAL_TIM_Base_Stop(&htim3);  // Stop timer trigger
     conversion_ready = 1;
+  }
+}
+
+/* UART transmission complete callback */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1) {
+    uart_tx_busy = 0;
   }
 }
 
@@ -87,6 +103,7 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_SPI1_Init();
+  MX_USART1_UART_Init();  // Initialize UART for easier communication
   MX_TIM3_Init();
 
   /* ADC Calibration */
@@ -121,13 +138,17 @@ int main(void)
   /* Infinite loop */
   while (1)
   {
-    if (conversion_ready) {
+    if (conversion_ready && !uart_tx_busy) {
       conversion_ready = 0;
 
-      /* Pack data into SPI buffer */
+      /* Pack data into buffer */
       pack_buffer();
 
-      /* Restart SPI DMA transmission with new data */
+      /* Send via UART (non-blocking) - More reliable than SPI slave! */
+      uart_tx_busy = 1;
+      HAL_UART_Transmit_IT(&huart1, tx_buffer, TX_BYTES);
+
+      /* Also send via SPI for backward compatibility (optional) */
       HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
 
       /* Restart ADC DMA */
@@ -243,6 +264,26 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function (UART Mode)
+  * @note PA9=TX, PA10=RX. Use USB-to-Serial adapter or connect to Pi4 UART
+  */
+static void MX_USART1_UART_Init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 2000000;  // 2 Mbps for high-speed data transfer
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * @brief TIM3 Initialization Function
   * @note Timer configured for ~600kHz ADC trigger
   */
@@ -291,6 +332,10 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel3_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+
+  /* USART1 interrupt init */
+  HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 /**
