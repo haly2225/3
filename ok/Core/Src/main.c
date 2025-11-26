@@ -29,7 +29,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
-UART_HandleTypeDef huart1;  // Add UART for simpler communication
+// UART_HandleTypeDef huart1;  // UART disabled - need to add driver files first
 TIM_HandleTypeDef htim3;
 
 uint16_t adc_buffer[BUFFER_SIZE] __attribute__((aligned(4)));
@@ -37,7 +37,7 @@ uint8_t  tx_buffer[TX_BYTES] __attribute__((aligned(4)));
 
 volatile uint16_t frame_counter = 0;
 volatile uint8_t conversion_ready = 0;
-volatile uint8_t uart_tx_busy = 0;
+// volatile uint8_t uart_tx_busy = 0;  // UART disabled
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -45,7 +45,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI1_Init(void);
-static void MX_USART1_UART_Init(void);
+// static void MX_USART1_UART_Init(void);  // UART disabled
 static void MX_TIM3_Init(void);
 
 /* Pack buffer for SPI transmission */
@@ -79,13 +79,15 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   }
 }
 
-/* UART transmission complete callback */
+/* UART transmission complete callback - DISABLED */
+/*
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1) {
     uart_tx_busy = 0;
   }
 }
+*/
 
 /**
   * @brief  The application entry point.
@@ -103,7 +105,7 @@ int main(void)
   MX_DMA_Init();
   MX_ADC1_Init();
   MX_SPI1_Init();
-  MX_USART1_UART_Init();  // Initialize UART for easier communication
+  // MX_USART1_UART_Init();  // UART disabled - need driver files
   MX_TIM3_Init();
 
   /* ADC Calibration */
@@ -138,17 +140,17 @@ int main(void)
   /* Infinite loop */
   while (1)
   {
-    if (conversion_ready && !uart_tx_busy) {
+    if (conversion_ready) {  // UART check removed
       conversion_ready = 0;
 
       /* Pack data into buffer */
       pack_buffer();
 
-      /* Send via UART (non-blocking) - More reliable than SPI slave! */
-      uart_tx_busy = 1;
-      HAL_UART_Transmit_IT(&huart1, tx_buffer, TX_BYTES);
+      /* Send via UART - DISABLED (need driver files) */
+      // uart_tx_busy = 1;
+      // HAL_UART_Transmit_IT(&huart1, tx_buffer, TX_BYTES);
 
-      /* Also send via SPI for backward compatibility (optional) */
+      /* Send via SPI */
       HAL_SPI_Transmit_DMA(&hspi1, tx_buffer, TX_BYTES);
 
       /* Restart ADC DMA */
@@ -264,9 +266,11 @@ static void MX_SPI1_Init(void)
 }
 
 /**
-  * @brief USART1 Initialization Function (UART Mode)
+  * @brief USART1 Initialization Function (UART Mode) - DISABLED
   * @note PA9=TX, PA10=RX. Use USB-to-Serial adapter or connect to Pi4 UART
+  * @note Disabled: Need to add stm32f1xx_hal_uart.c/h driver files to project
   */
+/*
 static void MX_USART1_UART_Init(void)
 {
   huart1.Instance = USART1;
@@ -282,6 +286,7 @@ static void MX_USART1_UART_Init(void)
     Error_Handler();
   }
 }
+*/
 
 /**
   * @brief TIM3 Initialization Function
@@ -333,9 +338,9 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
-  /* USART1 interrupt init */
-  HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
-  HAL_NVIC_EnableIRQ(USART1_IRQn);
+  /* USART1 interrupt init - DISABLED */
+  // HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
+  // HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 /**

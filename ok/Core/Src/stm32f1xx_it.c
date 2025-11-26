@@ -47,7 +47,7 @@
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_adc1;
 extern DMA_HandleTypeDef hdma_spi1_tx;
-extern UART_HandleTypeDef huart1;
+// extern UART_HandleTypeDef huart1;  // UART disabled
 /* USER CODE BEGIN EV */
 /* USER CODE END EV */
 
@@ -204,17 +204,16 @@ void DMA1_Channel3_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles USART1 global interrupt.
+  * @brief This function handles USART1 global interrupt - DISABLED.
   * @note  This is for UART TX/RX interrupt
+  * @note  Disabled: UART support requires driver files
   */
+/*
 void USART1_IRQHandler(void)
 {
-  /* USER CODE BEGIN USART1_IRQn 0 */
-  /* USER CODE END USART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart1);
-  /* USER CODE BEGIN USART1_IRQn 1 */
-  /* USER CODE END USART1_IRQn 1 */
 }
+*/
 
 /* USER CODE BEGIN 1 */
 /* USER CODE END 1 */
