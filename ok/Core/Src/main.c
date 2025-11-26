@@ -159,12 +159,28 @@ int main(void)
   /* Start Timer to trigger ADC */
   HAL_TIM_Base_Start(&htim3);
 
-  /* LED on to indicate running */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+  /* LED test: blink to verify hardware */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  // LED ON
+  HAL_Delay(500);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);    // LED OFF
+  HAL_Delay(500);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  // LED ON again
+  HAL_Delay(500);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);    // LED OFF
 
   /* Infinite loop */
+  uint32_t led_heartbeat = HAL_GetTick();
+  uint8_t led_state = 0;
+
   while (1)
   {
+    // LED heartbeat: toggle every 500ms to verify code is running
+    if (HAL_GetTick() - led_heartbeat >= 500) {
+      led_state = !led_state;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, led_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      led_heartbeat = HAL_GetTick();
+    }
+
     if (conversion_ready) {  // UART check removed
       conversion_ready = 0;
 
